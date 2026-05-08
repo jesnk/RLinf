@@ -35,13 +35,17 @@ def test_single_velocity_gate_shape():
 
 
 def test_single_velocity_gate_init_value():
-    """init_value=0 → sigmoid=0.5 → output ≈ 0.5*v at init."""
+    """init_value=0 -> sigmoid ~= 0.5 -> output ~= 0.5*v at init.
+
+    Note: last linear has small std (1e-3) instead of zeros to keep BPTT chain
+    intact; this introduces O(1e-3) noise in the initial gate. SFT preservation
+    requires only that gate ~ 0.5 at init within ~1% (=> atol 1e-2).
+    """
     gate = SingleVelocityGate(d_model=8, action_dim=4, hidden_dims=(4,), init_value=0.0)
     h = torch.zeros(2, 3, 8)
     v = torch.ones(2, 3, 4)
     out = gate(h, v)
-    # last linear has zeros weight & init_value=0 bias → logit=0 → sigmoid(0)=0.5
-    assert torch.allclose(out, torch.full_like(v, 0.5), atol=1e-6)
+    assert torch.allclose(out, torch.full_like(v, 0.5), atol=1e-2)
 
 
 def test_single_velocity_gate_grad_flows():

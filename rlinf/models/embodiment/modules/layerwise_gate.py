@@ -66,10 +66,14 @@ class SingleVelocityGate(nn.Module):
             in_dim = h
         layers.append(nn.Linear(in_dim, action_dim))
         self.gate_net = nn.Sequential(*layers)
-        # init last linear so gate logit ≈ init_value → sigmoid(init_value)
+        # sigma N1: keep gate output ~ sigmoid(init_value) but with NON-zero last
+        # linear weights so BPTT chain does not collapse at the last linear at step 0.
+        # zero-init weight blocks gradient to upstream gate MLP layers, which would
+        # prevent input-conditional gating from being learned via critic gradient
+        # (multi-step BPTT pathwise) -- contradicts sigma N1 design.
         last_lin = self.gate_net[-1]
         assert isinstance(last_lin, nn.Linear)
-        nn.init.zeros_(last_lin.weight)
+        nn.init.normal_(last_lin.weight, std=1e-3)
         nn.init.constant_(last_lin.bias, init_value)
 
     def forward(self, suffix_hidden: torch.Tensor, velocity: torch.Tensor) -> torch.Tensor:
