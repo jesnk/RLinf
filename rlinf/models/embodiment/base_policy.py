@@ -27,6 +27,9 @@ class ForwardType(Enum):
     IQL_CRITIC = "iql_critic"
     IQL_VALUE = "iql_value"
     NFT = "nft"
+    # σ N1 Chunked SAC-Flow (CSF) — pathwise actor + chunked Q on flow VLA
+    CSF = "csf"
+    CSF_Q = "csf_q"
 
 
 class BasePolicy(ABC):
@@ -67,6 +70,13 @@ class BasePolicy(ABC):
         raise NotImplementedError
 
     def iql_forward(self, **kwargs):
+        raise NotImplementedError
+
+    # σ N1 — Chunked SAC-Flow (CSF) on π0.5
+    def csf_forward(self, **kwargs):
+        raise NotImplementedError
+
+    def csf_q_forward(self, **kwargs):
         raise NotImplementedError
 
     def prepare_dagger_sft_batch(self, batch):

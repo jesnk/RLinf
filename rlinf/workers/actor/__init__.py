@@ -16,6 +16,14 @@ from omegaconf import DictConfig
 
 from rlinf.scheduler.worker.worker import Worker
 
+# sigma N1 — Chunked SAC-Flow worker export (lazy import to avoid hard
+# dependency on openpi for non-CSF runs).
+def get_csf_worker_cls():
+    from rlinf.workers.actor.fsdp_csf_policy_worker import (
+        EmbodiedCSFFSDPPolicy,
+    )
+    return EmbodiedCSFFSDPPolicy
+
 
 def get_actor_worker(cfg: DictConfig) -> Worker:
     if cfg.actor.training_backend == "fsdp":

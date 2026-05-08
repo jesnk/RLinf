@@ -29,6 +29,11 @@ from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.embodiment.openpi.openpi_csf_head import (
+    build_csf_components,
+    csf_forward_impl,
+    csf_q_forward_impl,
+)
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 
@@ -84,6 +89,16 @@ class OpenPi0Config(Pi0Config):
 
     # ===== NFT-specific parameters =====
     is_nft: bool = False
+
+    # ===== σ N1 Chunked SAC-Flow (CSF) parameters =====
+    use_csf: bool = False  # Enable Chunked SAC-Flow (σ N1)
+    csf_num_q_heads: int = 4  # K=4 multi-Q ensemble for LCB pessimism
+    csf_layerwise_gate: bool = False  # σ N2 — per-layer Gemma gating
+    csf_kl_beta: float = 0.0  # KL-to-π0-ref regularizer weight
+    csf_bc_beta: float = 1.0  # BC regularizer weight
+    csf_critic_state_dim: int = 512  # critic state proj dim
+    csf_sde_noise: float = 0.05  # SDE step noise (small for low BPTT div)
+    csf_pessimism: float = 1.0  # LCB std multiplier
 
 
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
@@ -234,6 +249,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 output_dim=1,
             ).to(dtype=_dsrl_dtype)
 
+        # ===== sigma N1 — CSF components init =====
+        if getattr(self.config, "use_csf", False):
+            build_csf_components(self, self.config)
+
         for name, module in self.named_modules():
             # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
             path_parts = name.split(".")
@@ -320,8 +339,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.sac_forward(**kwargs)
         elif forward_type == ForwardType.SAC_Q:
             return self.sac_q_forward(**kwargs)
+        elif forward_type == ForwardType.CSF:
+            return self.csf_forward(**kwargs)
+        elif forward_type == ForwardType.CSF_Q:
+            return self.csf_q_forward(**kwargs)
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"forward_type={forward_type}")
 
     def sft_forward(self, data, **kwargs):
         if hasattr(self, "gradient_checkpointing_disable"):
@@ -1346,6 +1369,19 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         resized_img = resized_img.unsqueeze(1)
 
         return resized_img
+
+    # ===== sigma N1 Chunked SAC-Flow (CSF) methods =====
+    def csf_forward(self, **kwargs):
+        """sigma N1 — pathwise flow-VLA actor with Flow-G/T velocity reparam."""
+        if not self.config.use_csf:
+            raise ValueError("csf_forward called but use_csf=False")
+        return csf_forward_impl(self, **kwargs)
+
+    def csf_q_forward(self, **kwargs):
+        """sigma N1 — Q(s, a) via shared pi0.5 backbone + MultiQHead."""
+        if not self.config.use_csf:
+            raise ValueError("csf_q_forward called but use_csf=False")
+        return csf_q_forward_impl(self, **kwargs)
 
     def _preprocess_states(self, states):
         """
