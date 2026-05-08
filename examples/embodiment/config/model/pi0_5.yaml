@@ -1,7 +1,7 @@
 model_type: "openpi"
 
 # Model path - should be set in specific config files
-model_path: "/path/to/model/openpi"
+model_path: "/home/jskang/sigma/ckpt/pi05_libero_sft"
 
 precision: null # for openpi, precision is null, please do not change this value
 
