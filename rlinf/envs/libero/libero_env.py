@@ -349,6 +349,12 @@ class LiberoEnv(gym.Env):
                 }
             )
             task_descriptions.append(task.language)
+            # Record which bddl variant this env_id is using (LIBERO-PRO).
+            # Lets `_get_reset_states` load the matching swap-perturbed
+            # init_states instead of the standard ones.
+            if not hasattr(self, "_env_bddl_paths"):
+                self._env_bddl_paths = [None] * self.num_envs
+            self._env_bddl_paths[env_id] = final_path
 
         self.task_descriptions = task_descriptions
         return env_fn_params
@@ -471,13 +477,73 @@ class LiberoEnv(gym.Env):
     def _get_reset_states(self, env_idx):
         if env_idx is None:
             env_idx = np.arange(self.num_envs)
-        init_state = [
-            self.task_suite.get_task_init_states(self.task_ids[env_id])[
-                self.trial_ids[env_id]
-            ]
-            for env_id in env_idx
-        ]
+        init_state = []
+        for env_id in env_idx:
+            ev = self._maybe_load_swap_init_state(env_id)
+            if ev is not None:
+                init_state.append(ev)
+            else:
+                init_state.append(
+                    self.task_suite.get_task_init_states(self.task_ids[env_id])[
+                        self.trial_ids[env_id]
+                    ]
+                )
         return init_state
+
+    def _maybe_load_swap_init_state(self, env_id):
+        """LIBERO-PRO position-perturbation: load init state from the
+        swap-bddl-matched .pruned_init when LIBERO_TYPE=pro and a
+        per-env bddl path with a `_<pert>{N}` suffix was chosen.
+
+        Returns the qpos array or None if not applicable.
+        """
+        variant = os.environ.get(
+            "LIBERO_TYPE",
+            self.cfg.get("libero_variant", "standard")
+            if hasattr(self.cfg, "get")
+            else "standard",
+        )
+        if variant != "pro":
+            return None
+        bddl_paths = getattr(self, "_env_bddl_paths", None)
+        if not bddl_paths:
+            return None
+        bddl_path = bddl_paths[env_id]
+        if not bddl_path:
+            return None
+        # Detect perturbation suffix from filename ("...{stem}_swap{N}.bddl")
+        import re as _re
+
+        bn = os.path.basename(bddl_path)
+        m = _re.match(r"^(.*)_(swap|object|lan|task)(\d+)\.bddl$", bn)
+        if not m:
+            return None
+        stem = m.group(1)
+        pert = m.group(2)
+        v = m.group(3)
+        # Compute init_files root (same overlay as bddl_files root)
+        bddl_dir = os.path.dirname(bddl_path)
+        bddl_root = os.path.dirname(bddl_dir)
+        init_root = os.environ.get("LIBEROPRO_INIT_FILES_ROOT")
+        if not init_root:
+            # default: sibling dir replacing bddl_files -> init_files
+            init_root = bddl_root.replace("bddl_files", "init_files")
+        init_path = os.path.join(
+            init_root,
+            os.path.basename(bddl_dir),  # e.g. libero_spatial_swap
+            f"{stem}_{pert}{v}.pruned_init",
+        )
+        if not os.path.isfile(init_path):
+            return None
+        try:
+            states = torch.load(init_path, weights_only=False)
+        except Exception as e:
+            print(f"[LiberoEnv] swap init load fail {init_path}: {e}")
+            return None
+        # `states` is array of N init states; pick by trial_id (mod len).
+        trial_id = self.trial_ids[env_id]
+        idx = trial_id % len(states)
+        return states[idx]
 
     @property
     def elapsed_steps(self):
