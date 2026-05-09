@@ -97,7 +97,15 @@ class ReplayBufferDataset(IterableDataset):
                 is_ready = False
 
             if is_ready:
-                if self.demo_buffer is not None:
+                # σ N1 fix: fall back to replay-only when demo_buffer is configured
+                # but contains no transitions (e.g. load_path=null and no HITL data
+                # collected yet). is_ready(0) returns True for an empty buffer so we
+                # need an explicit total_samples check before sampling.
+                use_demo = (
+                    self.demo_buffer is not None
+                    and self.demo_buffer.total_samples > 0
+                )
+                if use_demo:
                     replay_batch = self.replay_buffer.sample(self.batch_size // 2)
                     demo_batch = self.demo_buffer.sample(self.batch_size // 2)
                     batch = concat_batch(replay_batch, demo_batch)
@@ -196,7 +204,15 @@ class PreloadReplayBufferDataset(ReplayBufferDataset):
                 is_ready = False
 
             if is_ready:
-                if self.demo_buffer is not None:
+                # σ N1 fix: fall back to replay-only when demo_buffer is configured
+                # but contains no transitions (e.g. load_path=null and no HITL data
+                # collected yet). is_ready(0) returns True for an empty buffer so we
+                # need an explicit total_samples check before sampling.
+                use_demo = (
+                    self.demo_buffer is not None
+                    and self.demo_buffer.total_samples > 0
+                )
+                if use_demo:
                     replay_batch = self.replay_buffer.sample(self.batch_size // 2)
                     demo_batch = self.demo_buffer.sample(self.batch_size // 2)
                     batch = concat_batch(replay_batch, demo_batch)

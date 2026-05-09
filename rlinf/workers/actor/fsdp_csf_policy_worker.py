@@ -113,6 +113,48 @@ class EmbodiedCSFFSDPPolicy(EmbodiedSACFSDPPolicy):
         return super().soft_update_target_model(tau=tau)
 
     # =========================================================================
+    # σ N1 obs adapter — env-format obs → model-input dict
+    # =========================================================================
+    def _build_csf_obs(self, env_obs: dict, forward_inputs: dict) -> dict:
+        """Build CSF model-input obs dict from replay-buffer obs.
+
+        Replay buffer stores `curr_obs` / `next_obs` in env format
+        (`main_images`, `wrist_images`, `states` after `task_descriptions` is
+        popped). The π0.5 CSF forward path goes through `input_transform` ->
+        `_preprocess_observation` which expects either:
+          - `prompt` (raw string, first-pass) — not stored in buffer, OR
+          - `observation/image`, `observation/state`, … keys with tokenized_prompt.
+
+        We construct the second format by combining env-format obs with
+        per-chunk `tokenized_prompt` / `tokenized_prompt_mask` from
+        `forward_inputs` (which was captured at rollout time and is identical
+        for `curr_obs` and `next_obs` within the same chunk).
+
+        Returns a dict suitable for `self.model(forward_type=CSF, obs=...)`.
+        """
+        obs_dict: dict = {}
+
+        if "main_images" in env_obs:
+            obs_dict["observation/image"] = env_obs["main_images"]
+        if env_obs.get("wrist_images") is not None and "wrist_images" in env_obs:
+            obs_dict["observation/wrist_image"] = env_obs["wrist_images"]
+        if env_obs.get("extra_view_images") is not None and "extra_view_images" in env_obs:
+            obs_dict["observation/extra_view_image"] = env_obs["extra_view_images"]
+        if "states" in env_obs:
+            obs_dict["observation/state"] = env_obs["states"]
+
+        # Carry tokenized prompt from forward_inputs (constant within a chunk).
+        if forward_inputs is not None:
+            if "tokenized_prompt" in forward_inputs:
+                obs_dict["tokenized_prompt"] = forward_inputs["tokenized_prompt"]
+            if "tokenized_prompt_mask" in forward_inputs:
+                obs_dict["tokenized_prompt_mask"] = forward_inputs[
+                    "tokenized_prompt_mask"
+                ]
+
+        return obs_dict
+
+    # =========================================================================
     # CSF forward / loss
     # =========================================================================
     @Worker.timer("forward_critic")
@@ -142,6 +184,76 @@ class EmbodiedCSFFSDPPolicy(EmbodiedSACFSDPPolicy):
         actions = batch["actions"]
         rewards = batch["rewards"]  # [B, H] chunk-level
         terminations = batch["terminations"]  # [B, H]
+        forward_inputs = batch.get("forward_inputs", {})
+
+        # σ N1: convert env-format obs → model-input dict (with tokenized_prompt)
+        curr_obs_csf = self._build_csf_obs(curr_obs, forward_inputs)
+        next_obs_csf = self._build_csf_obs(next_obs, forward_inputs)
+
+        # σ N1: replay buffer stores `actions` in env-flat shape
+        # `[B, num_action_chunks * env_action_dim]` (e.g. [B, 35] for H=5, dim=7).
+        # The π0.5 flow expert's `action_in_proj` requires the *internal*
+        # action shape `[B, action_horizon, action_dim]` where action_horizon
+        # is the FULL flow horizon (e.g. 10 for pi05_libero) and action_dim is
+        # the model's internal padded dim (32). forward_inputs carries
+        # `model_action` = `outputs["actions"].reshape(B, -1)` from rollout
+        # at full horizon; reshape it back into [B, action_horizon, 32].
+        # NB: we read action_horizon from the underlying module config (the
+        # FSDP-wrapped π0.5 model exposes `.config.action_horizon`); fall back
+        # to 10 (pi05_libero default) if unavailable.
+        try:
+            inner_module = self.model.module if hasattr(self.model, "module") else self.model
+            action_horizon = int(inner_module.config.action_horizon)
+            model_action_dim = int(inner_module.config.action_dim)
+        except (AttributeError, TypeError):
+            action_horizon = 10
+            model_action_dim = 32
+        if "model_action" in forward_inputs:
+            model_actions = forward_inputs["model_action"]
+            if model_actions.dim() == 2:
+                B = model_actions.shape[0]
+                # model_action might be at full horizon (B, action_horizon * action_dim)
+                # or truncated (B, action_chunk * action_dim). Detect via flat dim.
+                flat = model_actions.shape[1]
+                if flat == action_horizon * model_action_dim:
+                    model_actions = model_actions.reshape(B, action_horizon, model_action_dim)
+                elif flat % model_action_dim == 0:
+                    h = flat // model_action_dim
+                    model_actions = model_actions.reshape(B, h, model_action_dim)
+                else:
+                    model_actions = actions  # fallback
+        else:
+            # σ N1 fallback: env-flat actions [B, H*env_dim] → padded model shape
+            # [B, action_horizon, model_action_dim] with zero padding.
+            # Replay buffer stores env-flat; π0.5 expert needs padded model shape.
+            # TODO(sigma-phase2): persist forward_inputs into replay buffer so we
+            # don't lose model_action; this padding is a structural placeholder.
+            import torch
+            B = actions.shape[0]
+            H_actual = self.num_action_chunks
+            if actions.dim() == 2 and actions.shape[1] % H_actual == 0:
+                env_a_dim = actions.shape[1] // H_actual
+                model_actions = actions.reshape(B, H_actual, env_a_dim)
+            elif actions.dim() == 3:
+                model_actions = actions
+                env_a_dim = model_actions.shape[-1]
+            else:
+                model_actions = actions
+                env_a_dim = model_action_dim
+            if model_actions.dim() == 3 and env_a_dim < model_action_dim:
+                pad_dim = model_action_dim - env_a_dim
+                pad = torch.zeros(
+                    B, model_actions.shape[1], pad_dim,
+                    dtype=actions.dtype, device=actions.device,
+                )
+                model_actions = torch.cat([model_actions, pad], dim=-1)
+            if model_actions.dim() == 3 and model_actions.shape[1] < action_horizon:
+                pad_h = action_horizon - model_actions.shape[1]
+                pad = torch.zeros(
+                    B, pad_h, model_action_dim,
+                    dtype=model_actions.dtype, device=model_actions.device,
+                )
+                model_actions = torch.cat([model_actions, pad], dim=1)
 
         # ---------------------------------------------------------------
         # 1. target Q from target_model: pathwise sample at next state
@@ -150,7 +262,7 @@ class EmbodiedCSFFSDPPolicy(EmbodiedSACFSDPPolicy):
             # next-state action via target actor
             target_out = self.target_model(
                 forward_type=ForwardType.CSF,
-                obs=next_obs,
+                obs=next_obs_csf,
                 train=True,
             )
             next_action = target_out["action"]
@@ -160,7 +272,7 @@ class EmbodiedCSFFSDPPolicy(EmbodiedSACFSDPPolicy):
             # K-ensemble Q at (next_obs, next_action) — share suffix feature
             all_qf_next_target = self.target_model(
                 forward_type=ForwardType.CSF_Q,
-                obs=next_obs,
+                obs=next_obs_csf,
                 actions=next_action,
                 suffix_features=next_suffix,
             )  # [B, K]
@@ -187,8 +299,8 @@ class EmbodiedCSFFSDPPolicy(EmbodiedSACFSDPPolicy):
         # ---------------------------------------------------------------
         all_data_q_values = self.model(
             forward_type=ForwardType.CSF_Q,
-            obs=curr_obs,
-            actions=actions,
+            obs=curr_obs_csf,
+            actions=model_actions,
         )  # [B, K]
 
         target_q_values = target_q_values.to(dtype=all_data_q_values.dtype)
@@ -218,14 +330,18 @@ class EmbodiedCSFFSDPPolicy(EmbodiedSACFSDPPolicy):
             return super().forward_actor(batch)
 
         curr_obs = batch["curr_obs"]
+        forward_inputs = batch.get("forward_inputs", {})
         demo_actions = batch.get("actions")  # demo or behavior actions
+
+        # σ N1: convert env-format obs → model-input dict (with tokenized_prompt)
+        curr_obs_csf = self._build_csf_obs(curr_obs, forward_inputs)
 
         # ---------------------------------------------------------------
         # 1. actor forward — pathwise BPTT (no detach)
         # ---------------------------------------------------------------
         out = self.model(
             forward_type=ForwardType.CSF,
-            obs=curr_obs,
+            obs=curr_obs_csf,
             train=True,
         )
         pi = out["action"]  # [B, H, A]
@@ -237,7 +353,7 @@ class EmbodiedCSFFSDPPolicy(EmbodiedSACFSDPPolicy):
         # ---------------------------------------------------------------
         all_qf_pi = self.model(
             forward_type=ForwardType.CSF_Q,
-            obs=curr_obs,
+            obs=curr_obs_csf,
             actions=pi,
             suffix_features=suffix_features,
             detach_encoder=False,  # σ pathwise SAC: gradient flows
@@ -271,7 +387,7 @@ class EmbodiedCSFFSDPPolicy(EmbodiedSACFSDPPolicy):
             with torch.no_grad():
                 ref_out = self.ref_model(
                     forward_type=ForwardType.CSF,
-                    obs=curr_obs,
+                    obs=curr_obs_csf,
                     train=False,
                 )
                 ref_action = ref_out["action"].detach()
@@ -301,10 +417,19 @@ class EmbodiedCSFFSDPPolicy(EmbodiedSACFSDPPolicy):
         if not self.use_csf:
             return super().forward_alpha(batch)
         curr_obs = batch["curr_obs"]
+        forward_inputs = batch.get("forward_inputs", {})
+
+        # σ N1 fix: convert env-format obs → model-input dict (with tokenized_prompt)
+        # before calling CSF forward. Without this, input_transform's
+        # `{k: v for k in inputs if "/" in k}` filter strips ALL keys
+        # (env-format uses `main_images`, `wrist_images`, `states` — none with "/")
+        # and `next(... shape[0] for v in inputs.values())` raises StopIteration,
+        # surfacing as "coroutine raised StopIteration" (RuntimeError) in 3.11.
+        curr_obs_csf = self._build_csf_obs(curr_obs, forward_inputs)
         with torch.no_grad():
             out = self.model(
                 forward_type=ForwardType.CSF,
-                obs=curr_obs,
+                obs=curr_obs_csf,
                 train=True,
             )
             log_pi = out["log_pi"].unsqueeze(-1)

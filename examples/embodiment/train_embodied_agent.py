@@ -58,6 +58,21 @@ def main(cfg) -> None:
         from rlinf.workers.actor.fsdp_nft_policy_worker import EmbodiedNFTFSDPPolicy
 
         actor_worker_cls = EmbodiedNFTFSDPPolicy
+    elif cfg.algorithm.loss_type == "embodied_csf":
+        # sigma N1 — Chunked SAC-Flow
+        from rlinf.workers.actor.fsdp_csf_policy_worker import EmbodiedCSFFSDPPolicy
+
+        actor_worker_cls = EmbodiedCSFFSDPPolicy
+    elif cfg.algorithm.loss_type == "embodied_qam":
+        # sigma baseline — QAM (adjoint matching)
+        from rlinf.workers.actor.fsdp_qam_policy_worker import EmbodiedQAMFSDPPolicy
+
+        actor_worker_cls = EmbodiedQAMFSDPPolicy
+    elif cfg.algorithm.loss_type == "embodied_aloe":
+        # sigma baseline — ALOE (advantage-weighted CFM)
+        from rlinf.workers.actor.fsdp_aloe_policy_worker import EmbodiedALOEFSDPPolicy
+
+        actor_worker_cls = EmbodiedALOEFSDPPolicy
     else:
         from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
