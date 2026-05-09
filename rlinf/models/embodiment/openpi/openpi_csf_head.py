@@ -122,9 +122,16 @@ def csf_forward_impl(
     images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
         observation, train=False
     )
-    device = state.device
+    # σ N1 fix: input_transform pipes through numpy → CPU tensors, so state.device
+    # would be CPU. Use the model's parameter device (CUDA) so vision_tower /
+    # paligemma get matching-device inputs and avoid
+    # "Input type (FloatTensor) and weight type (cuda.FloatTensor)" errors.
+    device = next(self.parameters()).device
     images = [img.to(device) for img in images]
     img_masks = [img_mask.to(device) for img_mask in img_masks]
+    state = state.to(device)
+    lang_tokens = lang_tokens.to(device)
+    lang_masks = lang_masks.to(device)
 
     # Prefix cache (frozen VLM)
     prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
@@ -230,9 +237,13 @@ def csf_q_forward_impl(
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
             observation, train=False
         )
-        device = state.device
+        # σ N1 fix: see csf_forward_impl — use model param device, not state.device.
+        device = next(self.parameters()).device
         images = [img.to(device) for img in images]
         img_masks = [img_mask.to(device) for img_mask in img_masks]
+        state = state.to(device)
+        lang_tokens = lang_tokens.to(device)
+        lang_masks = lang_masks.to(device)
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
             images, img_masks, lang_tokens, lang_masks
         )
