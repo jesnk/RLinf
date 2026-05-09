@@ -228,7 +228,6 @@ class EmbodiedCSFFSDPPolicy(EmbodiedSACFSDPPolicy):
             # Replay buffer stores env-flat; π0.5 expert needs padded model shape.
             # TODO(sigma-phase2): persist forward_inputs into replay buffer so we
             # don't lose model_action; this padding is a structural placeholder.
-            import torch
             B = actions.shape[0]
             H_actual = self.num_action_chunks
             if actions.dim() == 2 and actions.shape[1] % H_actual == 0:
