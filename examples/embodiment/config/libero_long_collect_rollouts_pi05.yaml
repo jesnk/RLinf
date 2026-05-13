@@ -1,0 +1,52 @@
+# σ-QRT Task 8 — offline rollout collection config.
+#
+# Used by examples/embodiment/collect_base_vla_rollouts.py to roll out
+# frozen π0.5 SFT on LIBERO-Long and pickle a list[Trajectory] that can
+# be loaded by TrajectoryReplayBuffer.from_offline_dataset() (Task 5).
+#
+# CLI overrides supported: --num_episodes, --output, --seed,
+# --max_episode_len, --env_override.
+
+defaults:
+  - _self_
+
+model:
+  # π0.5 LIBERO SFT (Task 1 ckpt).
+  vla_ckpt: "ckpts/pi05_libero_sft"
+  # Inference contract: π0.5 emits 10-step action chunks at 7-D action space.
+  chunk_len: 10
+  action_dim: 7
+  proprio_dim: 8
+  # openpi preset wired to LiberoInputs/Outputs + norm_stats.
+  config_name: "pi05_libero"
+  num_images_in_input: 2
+  num_steps: 5
+  unnorm_key: "libero_10"
+
+env:
+  # Internal LIBERO suite name = "libero_10" ("libero_long" in the paper).
+  # The script maps "libero_long" → "libero_10" so callers can use either.
+  name: "libero_long"
+  task_suite_name: "libero_10"
+  # Episode caps. The smoke test overrides via --max_episode_len so wall-clock
+  # stays bounded on CI; collection runs should keep 600.
+  max_episode_len: 600
+  reset_gripper_open: true
+  reward_coef: 5.0
+  use_rel_reward: true
+  group_size: 1
+  use_fixed_reset_state_ids: true
+  is_eval: true
+  auto_reset: false
+  ignore_terminations: false
+  # 256x256 cameras matches LIBERO RLinf eval default.
+  camera_heights: 256
+  camera_widths: 256
+
+collect:
+  num_episodes: 100
+  # bfloat16 z_obs storage is ~2 GB per 1k chunks at 968x2048 → cast at load if needed.
+  save_z_obs_dtype: "bfloat16"
+  # Frozen-VLA exploration noise scale on the reference chunk for σ-QRT data diversity.
+  # 0.0 = pure π0.5 SFT rollout. Default off; W2-3 buffer expansion may bump this.
+  action_noise_std: 0.0
