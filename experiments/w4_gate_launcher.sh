@@ -35,6 +35,7 @@ for SEED in 1 2 3; do
         --override "training.max_train_steps=10000" \
         --override "seed=${SEED}" \
         --no_wandb \
+        --bf16 \
         > ${VAR_OUT}_train.log 2>&1
     TR_RC=$?
     echo "[w4_gate $(date +%H:%M:%S)] σ-QRT seed=${SEED} train_rc=${TR_RC}" | tee -a ${OUT}/launcher.log
@@ -68,6 +69,7 @@ for SEED in 1 2 3; do
         --override "training.max_train_steps=10000" \
         --override "seed=${SEED}" \
         --no_wandb \
+        --bf16 \
         > ${VAR_OUT}_train.log 2>&1
     TR_RC=$?
     echo "[w4_gate $(date +%H:%M:%S)] A1 seed=${SEED} train_rc=${TR_RC}" | tee -a ${OUT}/launcher.log
