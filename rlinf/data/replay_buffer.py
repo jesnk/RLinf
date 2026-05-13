@@ -224,6 +224,14 @@ class TrajectoryCache:
         self._slot_to_id.clear()
 
 
+class _FlatStorageSchemaSkip(Exception):
+    """Internal sentinel: skip flat storage when trajectory schema lacks
+    σ-QRT nested obs dicts (e.g., synthetic test fixtures). Caller falls
+    back to the slow `sample()` path."""
+
+    pass
+
+
 class TrajectoryReplayBuffer:
     """
     Simplified trajectory-based replay buffer.
@@ -331,6 +339,15 @@ class TrajectoryReplayBuffer:
         # (typically CPU after Trajectory.to('cpu') in rollout); this is purely
         # informational so users can know where to move sampled batches.
         self._offline_device: Optional[str] = None
+
+        # σ-QRT optimization (Tier 1 #1): contiguous tensor storage built when
+        # an offline dataset with the Trajectory schema (curr_obs/next_obs nested
+        # dicts with z_obs/s_p/ref_action) is loaded. When populated, `sample()`
+        # uses a single vectorized indexing operation (~1 ms for B=128) instead
+        # of the per-chunk slow path (~seconds). None for non-Trajectory schemas
+        # (e.g., synthetic in-test fixtures) — slow path is then used.
+        self._flat_storage: Optional[dict[str, torch.Tensor]] = None
+        self._n_chunks: int = 0
 
         self._init_random_generator(self.seed)
 
@@ -507,10 +524,167 @@ class TrajectoryReplayBuffer:
         # False (default) so add_trajectories does not refuse our own writes.
         if trajectories:
             buf.add_trajectories(trajectories)
+            # σ-QRT Tier-1 optimization: build contiguous tensor storage so
+            # subsequent sample() calls use a single vectorized index_select
+            # instead of per-chunk Python loop + torch.stack (orders of
+            # magnitude faster). Silently skip if trajectories don't have the
+            # σ-QRT schema (curr_obs/next_obs with z_obs/s_p/ref_action) —
+            # then the slow path is used (backwards compat with synthetic
+            # test fixtures in test_replay_buffer_offline.py).
+            try:
+                buf._build_flat_storage(trajectories)
+            except _FlatStorageSchemaSkip:
+                buf._flat_storage = None
         # Now flip the flag — subsequent external writes will be rejected
         # (when offline_only=True; left False for hybrid mode).
         buf._offline_only = bool(offline_only)
         return buf
+
+    def _build_flat_storage(self, trajectories: list[Trajectory]) -> None:
+        """Build contiguous tensor `_flat_storage` from a Trajectory list.
+
+        The σ-QRT worker contract expects 9 keys (z_obs, next_z_obs, s_p,
+        next_s_p, action, ref_action, next_ref_action, reward, done). Each
+        trajectory tensor has shape [T, B=1, ...] (one episode per rollout
+        worker step in Task 8); we squeeze the B dim then concatenate along
+        chunk dim across all trajectories.
+
+        Memory footprint at B=2.5k LIBERO-Long offline dataset is ~37 GB
+        (bfloat16 for z_obs / next_z_obs; float32 elsewhere) — fits in the
+        ~256 GB host RAM available on brain1.
+
+        Raises _FlatStorageSchemaSkip if any trajectory lacks the σ-QRT
+        nested obs schema; caller catches and falls back to slow path.
+        """
+        # Pre-validate schema on the first trajectory before doing any work.
+        first = trajectories[0]
+        if (
+            not first.curr_obs
+            or not first.next_obs
+            or "z_obs" not in first.curr_obs
+            or "z_obs" not in first.next_obs
+            or "s_p" not in first.curr_obs
+            or "ref_action" not in first.curr_obs
+            or "ref_action" not in first.next_obs
+            or first.actions is None
+            or first.rewards is None
+            or first.dones is None
+        ):
+            raise _FlatStorageSchemaSkip(
+                "trajectory does not have σ-QRT nested obs schema"
+            )
+
+        # Walk all trajectories to compute total N_chunks.
+        n_chunks_per = []
+        for traj in trajectories:
+            # actions shape: [T, B, C, action_dim] → N = T*B (worker contract
+            # is per-(T,B) chunk; we flatten the leading 2 dims).
+            T, B = traj.actions.shape[:2]
+            n_chunks_per.append(T * B)
+        n_chunks = int(sum(n_chunks_per))
+        self._n_chunks = n_chunks
+
+        # Pre-allocate output tensors (one allocation each, then copy slabs).
+        # Get shapes from first trajectory.
+        z_obs_shape = first.curr_obs["z_obs"].shape[2:]  # [M, d]
+        s_p_shape = first.curr_obs["s_p"].shape[2:]  # [proprio_dim]
+        action_shape = first.actions.shape[2:]  # [C, action_dim]
+        ref_action_shape = first.curr_obs["ref_action"].shape[2:]  # [C, action_dim]
+        reward_shape = first.rewards.shape[2:]  # [C] or ()
+
+        # Preserve original dtype for z_obs (bfloat16 in collected rollouts);
+        # cast happens once at consumption (in run_qrt_offline.adapt path).
+        z_dtype = first.curr_obs["z_obs"].dtype
+
+        flat = {
+            "z_obs": torch.empty(
+                (n_chunks, *z_obs_shape), dtype=z_dtype
+            ),
+            "next_z_obs": torch.empty(
+                (n_chunks, *z_obs_shape), dtype=z_dtype
+            ),
+            "s_p": torch.empty(
+                (n_chunks, *s_p_shape), dtype=torch.float32
+            ),
+            "next_s_p": torch.empty(
+                (n_chunks, *s_p_shape), dtype=torch.float32
+            ),
+            "action": torch.empty(
+                (n_chunks, *action_shape), dtype=torch.float32
+            ),
+            "ref_action": torch.empty(
+                (n_chunks, *ref_action_shape), dtype=torch.float32
+            ),
+            "next_ref_action": torch.empty(
+                (n_chunks, *ref_action_shape), dtype=torch.float32
+            ),
+            "reward": torch.empty(
+                (n_chunks, *reward_shape), dtype=torch.float32
+            ),
+            "done": torch.empty((n_chunks,), dtype=torch.float32),
+        }
+
+        cursor = 0
+        for traj in trajectories:
+            T, B = traj.actions.shape[:2]
+            n = T * B
+            end = cursor + n
+
+            # z_obs (curr/next): [T, B, M, d] → [T*B, M, d]
+            flat["z_obs"][cursor:end].copy_(
+                traj.curr_obs["z_obs"].reshape(n, *z_obs_shape).to(z_dtype)
+            )
+            flat["next_z_obs"][cursor:end].copy_(
+                traj.next_obs["z_obs"].reshape(n, *z_obs_shape).to(z_dtype)
+            )
+
+            # s_p (curr/next): [T, B, proprio_dim] → [T*B, proprio_dim]
+            flat["s_p"][cursor:end].copy_(
+                traj.curr_obs["s_p"].reshape(n, *s_p_shape).float()
+            )
+            flat["next_s_p"][cursor:end].copy_(
+                traj.next_obs["s_p"].reshape(n, *s_p_shape).float()
+            )
+
+            # action: [T, B, C, action_dim] → [T*B, C, action_dim]
+            flat["action"][cursor:end].copy_(
+                traj.actions.reshape(n, *action_shape).float()
+            )
+
+            # ref_action (curr/next): [T, B, C, action_dim] → [T*B, C, action_dim]
+            flat["ref_action"][cursor:end].copy_(
+                traj.curr_obs["ref_action"].reshape(n, *ref_action_shape).float()
+            )
+            # next_ref_action: only present if next_obs has it
+            if "ref_action" in traj.next_obs:
+                flat["next_ref_action"][cursor:end].copy_(
+                    traj.next_obs["ref_action"]
+                    .reshape(n, *ref_action_shape)
+                    .float()
+                )
+            else:
+                # Fallback: zeros (shouldn't happen for collected rollouts).
+                flat["next_ref_action"][cursor:end].zero_()
+
+            # reward: [T, B, C] → [T*B, C]
+            flat["reward"][cursor:end].copy_(
+                traj.rewards.reshape(n, *reward_shape).float()
+            )
+
+            # done: [T, B] (or [T, 1]) → [T*B]
+            d = traj.dones.float().reshape(-1)
+            # Possible mismatch: dones might be [T, 1] when B=1 — that's
+            # already [T*B] after reshape; if [T, B] with B>1 same path.
+            assert d.numel() == n, (
+                f"dones numel mismatch: got {d.numel()}, expected {n} "
+                f"(T={T}, B={B})"
+            )
+            flat["done"][cursor:end].copy_(d)
+
+            cursor = end
+
+        self._flat_storage = flat
+
 
     def add_trajectories(self, trajectories: list[Trajectory]):
         """
@@ -628,6 +802,16 @@ class TrajectoryReplayBuffer:
             Dictionary with rollout batch format [B, ...]
         """
         assert num_chunks > 0
+        # σ-QRT fast path: if flat contiguous storage was built (Trajectory
+        # schema with curr_obs/next_obs), one randint + 9 index_select gives
+        # the entire batch ~1 ms vs ~seconds for the slow path. Returns the
+        # worker-contract dict directly (z_obs, next_z_obs, s_p, next_s_p,
+        # action, ref_action, next_ref_action, reward, done).
+        if self._flat_storage is not None and self._n_chunks > 0:
+            idx = torch.randint(
+                0, self._n_chunks, (num_chunks,), generator=self.random_generator
+            )
+            return {k: v.index_select(0, idx) for k, v in self._flat_storage.items()}
         return self.sample_chunks(num_chunks)
 
     def sample_chunks(self, num_chunks: int) -> dict[str, torch.Tensor]:

@@ -68,23 +68,56 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Buffer batch → worker batch contract adapter
 # --------------------------------------------------------------------------- #
+_WORKER_CONTRACT_KEYS = (
+    "z_obs",
+    "next_z_obs",
+    "s_p",
+    "next_s_p",
+    "action",
+    "ref_action",
+    "next_ref_action",
+    "reward",
+    "done",
+)
+
+
 def adapt_buffer_batch(batch: dict) -> dict:
     """Map TrajectoryReplayBuffer.sample() output → worker.train_step() contract.
 
-    Buffer schema (plural keys + curr_obs/next_obs nested dicts):
-        actions:    [B, chunk_len, action_dim]
-        rewards:    [B, chunk_len]
-        dones:      [B]
-        curr_obs.z_obs:      [B, M, d]
-        curr_obs.s_p:        [B, proprio_dim]
-        curr_obs.ref_action: [B, chunk_len, action_dim]
-        next_obs.<same>
+    Two input formats are supported:
 
-    Worker contract (singular):
-        z_obs, next_z_obs, s_p, next_s_p,
-        action, ref_action, next_ref_action,
-        reward, done.
+    1) Fast path (σ-QRT optimization, post-W4): buffer's `_flat_storage` is
+       populated, so sample() already returns the worker contract dict
+       (singular keys: z_obs, next_z_obs, s_p, next_s_p, action, ref_action,
+       next_ref_action, reward, done). Adapter just casts to float32 in
+       case the underlying storage is bfloat16 (z_obs/next_z_obs).
+
+    2) Slow path (legacy, when flat storage is not built): plural keys +
+       curr_obs/next_obs nested dicts:
+           actions:    [B, chunk_len, action_dim]
+           rewards:    [B, chunk_len]
+           dones:      [B]
+           curr_obs.z_obs:      [B, M, d]
+           curr_obs.s_p:        [B, proprio_dim]
+           curr_obs.ref_action: [B, chunk_len, action_dim]
+           next_obs.<same>
     """
+    if all(k in batch for k in _WORKER_CONTRACT_KEYS):
+        # Fast path: buffer already returned the worker contract. Cast z_obs
+        # tensors to float32 here (storage may be bfloat16 to save host RAM).
+        return {
+            "z_obs": batch["z_obs"].float(),
+            "next_z_obs": batch["next_z_obs"].float(),
+            "s_p": batch["s_p"].float(),
+            "next_s_p": batch["next_s_p"].float(),
+            "action": batch["action"].float(),
+            "ref_action": batch["ref_action"].float(),
+            "next_ref_action": batch["next_ref_action"].float(),
+            "reward": batch["reward"].float(),
+            "done": batch["done"].float(),
+        }
+
+    # Slow-path fallback: old nested schema.
     curr = batch["curr_obs"]
     next_ = batch["next_obs"]
     return {
