@@ -1,0 +1,64 @@
+# sigma-QRT on LIBERO-Long with pi0.5 frozen backbone.
+# Hyperparams locked from work/hbz/sigma/sigma_pivot_v2_design.md 2.8a pre-registration table.
+# Consumed by examples/embodiment/run_qrt_offline.py (Task 11) + QRTOfflinePolicyWorker (Task 6).
+
+defaults:
+  - _self_
+
+model:
+  vla_ckpt: "ckpts/pi05_libero_sft"
+  token_dim: 2048
+  encoder_layers: 4
+  encoder_heads: 8
+  encoder_ffn: 4096
+  decoder_layers: 4
+  decoder_heads: 8
+  decoder_ffn: 4096
+  decoder_max_len: 1024
+  actor_hidden: 256
+  actor_layers: 2
+  critic_hidden: 256
+  critic_layers: 2
+  action_dim: 7
+  proprio_dim: 8
+  chunk_len: 10
+
+training:
+  lr_actor: 1.0e-4
+  lr_critic: 1.0e-4
+  lr_encoder: 1.0e-4
+  batch_size: 256
+  gamma: 0.95
+  beta_bc: 0.3
+  alpha_recon: 0.5
+  tau_target: 0.005
+  actor_update_freq: 2
+  action_std: 0.05
+  target_noise_std: 0.2
+  target_noise_clip: 0.5
+  ref_action_dropout: 0.5
+  stop_grad_z_rl_next: true
+  grad_clip_norm: 1.0
+  warmup_steps: 2000          # Stage 1 token warmup (RLT App. B: 2k-10k)
+  max_train_steps: 50000      # Stage 2 joint training duration (W4 gate may shorten)
+  replay_warmup_fill: 2000
+  q_clamp: null               # Q-clamp default OFF; enable only if divergence observed
+
+env:
+  name: libero_long
+  num_tasks: 10
+  max_episode_len: 600
+  num_eval_episodes: 50
+
+data:
+  offline_buffer_path: "data/sigma_qrt/libero_long/transitions_B5k.pkl"
+  capacity: 30000
+
+logging:
+  wandb_project: "sigma_qrt"
+  wandb_run_name: "qrt_libero_long_pi05_B5k_seed${seed}"
+  log_interval: 100
+  eval_interval: 5000
+  save_interval: -1           # No ckpt save during W1-3 smoke
+
+seed: 1
