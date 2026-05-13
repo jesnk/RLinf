@@ -133,6 +133,35 @@ def adapt_buffer_batch(batch: dict) -> dict:
     }
 
 
+def _move_to_device_async(batch: dict, device) -> dict:
+    """Pin host memory + non_blocking H2D copy so transfer overlaps compute.
+
+    No-op on CPU device (pin_memory only useful for cuda destination).
+    Returns a new dict with tensors on `device`.
+    """
+    # str("cpu")/"cuda" or torch.device — normalize.
+    dev_str = str(device)
+    if dev_str == "cpu" or not torch.cuda.is_available():
+        return batch
+    out = {}
+    for k, v in batch.items():
+        if not isinstance(v, torch.Tensor):
+            out[k] = v
+            continue
+        # If already on cuda, leave it (defensive — should be on CPU from buf).
+        if v.is_cuda:
+            out[k] = v
+            continue
+        # pin_memory requires contiguous tensors; index_select results
+        # are already contiguous so this is cheap.
+        try:
+            pinned = v.pin_memory()
+        except Exception:
+            pinned = v
+        out[k] = pinned.to(device, non_blocking=True)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Variant builders
 # --------------------------------------------------------------------------- #
@@ -190,6 +219,9 @@ def _run_stage1(worker, buf, cfg, variant: str, device: str) -> list[dict]:
     for step in range(int(cfg.training.warmup_steps)):
         batch = buf.sample(num_chunks=batch_size)
         adapted = adapt_buffer_batch(batch)
+        # Tier-2 optimization: pinned-memory non_blocking H2D copy overlaps
+        # with previous step's GPU compute. No-op when device=cpu.
+        adapted = _move_to_device_async(adapted, worker.device)
         if variant == "qrt":
             m = _qrt_stage1_step(worker, adapted)
         else:
@@ -219,6 +251,7 @@ def _stage2_offline(worker, buf, cfg, variant: str) -> list[dict]:
     for step in range(max_steps):
         batch = buf.sample(num_chunks=batch_size)
         adapted = adapt_buffer_batch(batch)
+        adapted = _move_to_device_async(adapted, worker.device)
         if variant == "qrt":
             m = worker.train_step(adapted, step=step)
         else:
@@ -294,6 +327,7 @@ def _stage2_online_sim(worker, buf, cfg, _device: str) -> list[dict]:
 
         batch = buf.sample(num_chunks=batch_size)
         adapted = adapt_buffer_batch(batch)
+        adapted = _move_to_device_async(adapted, worker.device)
         m = worker.stage2_step(adapted, step=step)
         m = dict(m)
         m["phase"] = "stage2"
