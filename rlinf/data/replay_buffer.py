@@ -323,6 +323,15 @@ class TrajectoryReplayBuffer:
         self.seed = seed
         self.random_generator: Optional[torch.Generator] = None
 
+        # Offline-mode flag: if True, write entry-points raise RuntimeError.
+        # Default False so existing callers (SAC worker etc.) are unaffected.
+        self._offline_only: bool = False
+        # Device hint recorded by from_offline_dataset for downstream callers.
+        # The buffer itself stores tensors on whatever device the producer used
+        # (typically CPU after Trajectory.to('cpu') in rollout); this is purely
+        # informational so users can know where to move sampled batches.
+        self._offline_device: Optional[str] = None
+
         self._init_random_generator(self.seed)
 
     def _init_random_generator(self, seed):
@@ -437,6 +446,72 @@ class TrajectoryReplayBuffer:
 
         return trajectory
 
+    @classmethod
+    def from_offline_dataset(
+        cls,
+        path: str,
+        capacity: int,
+        device: str = "cpu",
+        offline_only: bool = True,
+        **buffer_kwargs,
+    ) -> "TrajectoryReplayBuffer":
+        """Load Trajectory objects from a pickle file into a TrajectoryReplayBuffer.
+
+        The pickle file must contain a `list[Trajectory]` (the buffer's canonical
+        write unit). Each Trajectory has tensors of shape [T, B, ...]; the buffer
+        will sample per-chunk batches the usual way via `sample()` / `sample_chunks()`.
+
+        Args:
+            path: Path to a pickle file containing list[Trajectory].
+            capacity: Maximum number of trajectories the buffer should hold. Must
+                be >= number of trajectories in the file. Used as the upper bound
+                on `sample_window_size` (the windowed sampling horizon) unless the
+                caller overrides `sample_window_size` via buffer_kwargs.
+            device: Informational device hint for downstream consumers of sampled
+                batches. The buffer itself stores tensors on whatever device the
+                producer used (typically CPU); callers can move batches as needed.
+            offline_only: If True (default), subsequent calls to
+                `add_trajectories()` raise RuntimeError with a message mentioning
+                "offline". Set False for offline+online hybrid use.
+            **buffer_kwargs: Forwarded to `TrajectoryReplayBuffer.__init__`
+                (e.g., seed, enable_cache, auto_save_path, ...). `sample_window_size`
+                defaults to `capacity` if not provided.
+
+        Returns:
+            A populated TrajectoryReplayBuffer with `len(buf)` equal to the number
+            of trajectories in the pickle.
+
+        Raises:
+            TypeError: if the pickled object is not a list.
+            ValueError: if `capacity` is smaller than the number of trajectories.
+        """
+        with open(path, "rb") as f:
+            trajectories = pkl.load(f)
+        if not isinstance(trajectories, list):
+            raise TypeError(
+                f"expected list of Trajectory objects, got {type(trajectories)}"
+            )
+        if capacity < len(trajectories):
+            raise ValueError(
+                f"capacity {capacity} < n trajectories {len(trajectories)} "
+                f"in {path}"
+            )
+
+        # Default sample_window_size to capacity so the full offline dataset is
+        # visible to sampling; allow override via buffer_kwargs.
+        buffer_kwargs.setdefault("sample_window_size", int(capacity))
+
+        buf = cls(**buffer_kwargs)
+        buf._offline_device = device
+        # Populate via the existing canonical write path WHILE offline_only is still
+        # False (default) so add_trajectories does not refuse our own writes.
+        if trajectories:
+            buf.add_trajectories(trajectories)
+        # Now flip the flag — subsequent external writes will be rejected
+        # (when offline_only=True; left False for hybrid mode).
+        buf._offline_only = bool(offline_only)
+        return buf
+
     def add_trajectories(self, trajectories: list[Trajectory]):
         """
         Add trajectories to the buffer.
@@ -446,6 +521,12 @@ class TrajectoryReplayBuffer:
             trajectories: List of Trajectory objects, each with shape [T, B, ...]
                      where T*B is the total number of samples in the trajectory.
         """
+        if getattr(self, "_offline_only", False):
+            raise RuntimeError(
+                "TrajectoryReplayBuffer was loaded in offline-only mode "
+                "(from_offline_dataset(offline_only=True)); writes are disabled. "
+                "Construct with offline_only=False for offline+online hybrid use."
+            )
         if not trajectories:
             return
 
