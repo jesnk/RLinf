@@ -348,6 +348,10 @@ class TrajectoryReplayBuffer:
         # (e.g., synthetic in-test fixtures) — slow path is then used.
         self._flat_storage: Optional[dict[str, torch.Tensor]] = None
         self._n_chunks: int = 0
+        # Device where _flat_storage tensors live (cpu / cuda:N). Set by
+        # _build_flat_storage(target_device=...). Used to allocate the
+        # sampling index on the same device for zero-copy GPU sampling.
+        self._flat_storage_device: torch.device = torch.device("cpu")
 
         self._init_random_generator(self.seed)
 
@@ -532,7 +536,7 @@ class TrajectoryReplayBuffer:
             # then the slow path is used (backwards compat with synthetic
             # test fixtures in test_replay_buffer_offline.py).
             try:
-                buf._build_flat_storage(trajectories)
+                buf._build_flat_storage(trajectories, target_device=device)
             except _FlatStorageSchemaSkip:
                 buf._flat_storage = None
         # Now flip the flag — subsequent external writes will be rejected
@@ -540,7 +544,11 @@ class TrajectoryReplayBuffer:
         buf._offline_only = bool(offline_only)
         return buf
 
-    def _build_flat_storage(self, trajectories: list[Trajectory]) -> None:
+    def _build_flat_storage(
+        self,
+        trajectories: list[Trajectory],
+        target_device: str = "cpu",
+    ) -> None:
         """Build contiguous tensor `_flat_storage` from a Trajectory list.
 
         The σ-QRT worker contract expects 9 keys (z_obs, next_z_obs, s_p,
@@ -551,7 +559,12 @@ class TrajectoryReplayBuffer:
 
         Memory footprint at B=2.5k LIBERO-Long offline dataset is ~37 GB
         (bfloat16 for z_obs / next_z_obs; float32 elsewhere) — fits in the
-        ~256 GB host RAM available on brain1.
+        ~256 GB host RAM available on brain1 OR a 180 GB B200 VRAM.
+
+        target_device='cuda[:N]' places the storage directly on GPU so
+        sample() returns GPU tensors with zero H2D copy — the σ-QRT
+        production path. target_device='cpu' (default) keeps storage in
+        pageable host RAM (legacy path; caller does pinned-memory H2D).
 
         Raises _FlatStorageSchemaSkip if any trajectory lacks the σ-QRT
         nested obs schema; caller catches and falls back to slow path.
@@ -596,32 +609,59 @@ class TrajectoryReplayBuffer:
         # cast happens once at consumption (in run_qrt_offline.adapt path).
         z_dtype = first.curr_obs["z_obs"].dtype
 
+        # Allocate on target_device. For cuda, sample() returns GPU tensors
+        # directly with zero H2D copy (~1 ms per sample). For cpu, sample()
+        # returns CPU tensors and caller does pinned H2D.
+        # Use torch.device() so 'cpu' / 'cuda' / 'cuda:0' all work.
+        try:
+            alloc_device = torch.device(target_device)
+        except (TypeError, RuntimeError):
+            alloc_device = torch.device("cpu")
+        # GPU allocation when explicitly requested AND cuda is available.
+        if alloc_device.type == "cuda" and not torch.cuda.is_available():
+            alloc_device = torch.device("cpu")
+        self._flat_storage_device = alloc_device
+
         flat = {
             "z_obs": torch.empty(
-                (n_chunks, *z_obs_shape), dtype=z_dtype
+                (n_chunks, *z_obs_shape), dtype=z_dtype, device=alloc_device
             ),
             "next_z_obs": torch.empty(
-                (n_chunks, *z_obs_shape), dtype=z_dtype
+                (n_chunks, *z_obs_shape), dtype=z_dtype, device=alloc_device
             ),
             "s_p": torch.empty(
-                (n_chunks, *s_p_shape), dtype=torch.float32
+                (n_chunks, *s_p_shape),
+                dtype=torch.float32,
+                device=alloc_device,
             ),
             "next_s_p": torch.empty(
-                (n_chunks, *s_p_shape), dtype=torch.float32
+                (n_chunks, *s_p_shape),
+                dtype=torch.float32,
+                device=alloc_device,
             ),
             "action": torch.empty(
-                (n_chunks, *action_shape), dtype=torch.float32
+                (n_chunks, *action_shape),
+                dtype=torch.float32,
+                device=alloc_device,
             ),
             "ref_action": torch.empty(
-                (n_chunks, *ref_action_shape), dtype=torch.float32
+                (n_chunks, *ref_action_shape),
+                dtype=torch.float32,
+                device=alloc_device,
             ),
             "next_ref_action": torch.empty(
-                (n_chunks, *ref_action_shape), dtype=torch.float32
+                (n_chunks, *ref_action_shape),
+                dtype=torch.float32,
+                device=alloc_device,
             ),
             "reward": torch.empty(
-                (n_chunks, *reward_shape), dtype=torch.float32
+                (n_chunks, *reward_shape),
+                dtype=torch.float32,
+                device=alloc_device,
             ),
-            "done": torch.empty((n_chunks,), dtype=torch.float32),
+            "done": torch.empty(
+                (n_chunks,), dtype=torch.float32, device=alloc_device
+            ),
         }
 
         cursor = 0
@@ -804,14 +844,28 @@ class TrajectoryReplayBuffer:
         assert num_chunks > 0
         # σ-QRT fast path: if flat contiguous storage was built (Trajectory
         # schema with curr_obs/next_obs), one randint + 9 index_select gives
-        # the entire batch ~1 ms vs ~seconds for the slow path. Returns the
+        # the entire batch in microseconds (storage on GPU) or ~100 ms
+        # (storage on CPU) vs ~seconds for the slow path. Returns the
         # worker-contract dict directly (z_obs, next_z_obs, s_p, next_s_p,
         # action, ref_action, next_ref_action, reward, done).
         if self._flat_storage is not None and self._n_chunks > 0:
-            idx = torch.randint(
-                0, self._n_chunks, (num_chunks,), generator=self.random_generator
+            # Sample idx on CPU for reproducibility (self.random_generator
+            # is a CPU generator). If storage is on GPU, transfer idx —
+            # 128 longs = 1 KB, ~microseconds.
+            idx_cpu = torch.randint(
+                0,
+                self._n_chunks,
+                (num_chunks,),
+                generator=self.random_generator,
             )
-            return {k: v.index_select(0, idx) for k, v in self._flat_storage.items()}
+            if self._flat_storage_device.type != "cpu":
+                idx = idx_cpu.to(self._flat_storage_device)
+            else:
+                idx = idx_cpu
+            return {
+                k: v.index_select(0, idx)
+                for k, v in self._flat_storage.items()
+            }
         return self.sample_chunks(num_chunks)
 
     def sample_chunks(self, num_chunks: int) -> dict[str, torch.Tensor]:

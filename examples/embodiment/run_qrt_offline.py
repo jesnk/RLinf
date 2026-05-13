@@ -187,20 +187,34 @@ def _build_worker(cfg, variant: str, device: str):
 # --------------------------------------------------------------------------- #
 # Stage 1 (token warmup)
 # --------------------------------------------------------------------------- #
-def _qrt_stage1_step(worker, batch_adapted: dict) -> dict:
+def _qrt_stage1_step(worker, batch_adapted: dict, use_bf16: bool = False) -> dict:
     """σ-QRT Stage 1 = encoder + decoder warmup with recon loss only.
 
     Mirrors RLTOnlineSimWorker.stage1_step but lives outside it so the
     σ-QRT worker (which does NOT freeze its encoder) can also do a
     warmup phase that's compatible with the (frozen-encoder) ablations.
+
+    When use_bf16=True, runs the encoder/decoder fwd + loss in
+    torch.autocast(bf16) so flash attention dispatches and ops use
+    tensor cores (10x speedup on B200 over fp32). Backward is run
+    outside autocast for numerical stability — gradients accumulate
+    in the original parameter dtype (fp32), and the bf16 backward
+    activations are produced inside autocast. bf16 doesn't need
+    GradScaler (unlike fp16); the 8-bit exponent range is sufficient.
     """
     from rlinf.algorithms.losses import rlt_recon_loss
 
     z_obs = batch_adapted["z_obs"].to(worker.device)
-    z_rl = worker.encoder(z_obs)
-    z_prev = z_obs[:, :-1].detach()
-    z_hat = worker.decoder(z_rl, z_prev)
-    loss = rlt_recon_loss(z_hat, z_obs.detach())
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if use_bf16 and z_obs.is_cuda
+        else _NullCtx()
+    )
+    with autocast_ctx:
+        z_rl = worker.encoder(z_obs)
+        z_prev = z_obs[:, :-1].detach()
+        z_hat = worker.decoder(z_rl, z_prev)
+        loss = rlt_recon_loss(z_hat, z_obs.detach())
     worker.opt_enc.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(
@@ -211,7 +225,19 @@ def _qrt_stage1_step(worker, batch_adapted: dict) -> dict:
     return {"loss_recon": float(loss.detach().item())}
 
 
-def _run_stage1(worker, buf, cfg, variant: str, device: str) -> list[dict]:
+class _NullCtx:
+    """No-op context manager (used when bf16 autocast disabled)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def _run_stage1(
+    worker, buf, cfg, variant: str, device: str, use_bf16: bool = False
+) -> list[dict]:
     """Encoder warmup loop. Same for all variants except dispatching method."""
     metrics: list[dict] = []
     log_iv = int(cfg.logging.get("log_interval", 100))
@@ -223,9 +249,17 @@ def _run_stage1(worker, buf, cfg, variant: str, device: str) -> list[dict]:
         # with previous step's GPU compute. No-op when device=cpu.
         adapted = _move_to_device_async(adapted, worker.device)
         if variant == "qrt":
-            m = _qrt_stage1_step(worker, adapted)
+            m = _qrt_stage1_step(worker, adapted, use_bf16=use_bf16)
         else:
-            m = worker.stage1_step({"z_obs": adapted["z_obs"]})
+            # RLTOnlineSimWorker.stage1_step doesn't accept bf16 flag; wrap
+            # in autocast externally so the encoder/decoder fwd inside use
+            # bf16. Backward is also inside autocast — that's fine for bf16
+            # (no GradScaler needed).
+            if use_bf16 and adapted["z_obs"].is_cuda:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    m = worker.stage1_step({"z_obs": adapted["z_obs"]})
+            else:
+                m = worker.stage1_step({"z_obs": adapted["z_obs"]})
         m = dict(m)
         m["phase"] = "stage1"
         m["step"] = step
@@ -242,7 +276,9 @@ def _run_stage1(worker, buf, cfg, variant: str, device: str) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Stage 2 (joint or actor-critic only)
 # --------------------------------------------------------------------------- #
-def _stage2_offline(worker, buf, cfg, variant: str) -> list[dict]:
+def _stage2_offline(
+    worker, buf, cfg, variant: str, use_bf16: bool = False
+) -> list[dict]:
     """Offline Stage 2 loop for qrt + a1_frozen_encoder."""
     metrics: list[dict] = []
     log_iv = int(cfg.logging.get("log_interval", 100))
@@ -252,10 +288,17 @@ def _stage2_offline(worker, buf, cfg, variant: str) -> list[dict]:
         batch = buf.sample(num_chunks=batch_size)
         adapted = adapt_buffer_batch(batch)
         adapted = _move_to_device_async(adapted, worker.device)
-        if variant == "qrt":
-            m = worker.train_step(adapted, step=step)
+        if use_bf16 and adapted["z_obs"].is_cuda:
+            autocast_ctx = torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16
+            )
         else:
-            m = worker.stage2_step(adapted, step=step)
+            autocast_ctx = _NullCtx()
+        with autocast_ctx:
+            if variant == "qrt":
+                m = worker.train_step(adapted, step=step)
+            else:
+                m = worker.stage2_step(adapted, step=step)
         m = dict(m)
         m["phase"] = "stage2"
         m["step"] = step
@@ -271,7 +314,9 @@ def _stage2_offline(worker, buf, cfg, variant: str) -> list[dict]:
     return metrics
 
 
-def _stage2_online_sim(worker, buf, cfg, _device: str) -> list[dict]:
+def _stage2_online_sim(
+    worker, buf, cfg, _device: str, use_bf16: bool = False
+) -> list[dict]:
     """Online Stage 2: env rollout interleaved with stage2_step.
 
     For W4 the env rollout is a single LIBERO env, so we collect 1
@@ -328,7 +373,11 @@ def _stage2_online_sim(worker, buf, cfg, _device: str) -> list[dict]:
         batch = buf.sample(num_chunks=batch_size)
         adapted = adapt_buffer_batch(batch)
         adapted = _move_to_device_async(adapted, worker.device)
-        m = worker.stage2_step(adapted, step=step)
+        if use_bf16 and adapted["z_obs"].is_cuda:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                m = worker.stage2_step(adapted, step=step)
+        else:
+            m = worker.stage2_step(adapted, step=step)
         m = dict(m)
         m["phase"] = "stage2"
         m["step"] = step
@@ -369,6 +418,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override auto device selection (cpu/cuda/cuda:N).",
     )
     p.add_argument("--no_wandb", action="store_true")
+    p.add_argument(
+        "--bf16",
+        action="store_true",
+        help=(
+            "Enable torch.autocast(bf16) for encoder/decoder/actor/critic "
+            "compute. ~10x speedup on B200 (flash attention dispatch + tensor "
+            "cores). bf16 has the same 8-bit exponent range as fp32, so no "
+            "GradScaler is needed. Recommended for paper-faithful runs on "
+            "GPU; CPU smoke tests should leave this off."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -390,9 +450,10 @@ def main(argv: list[str] | None = None) -> int:
     np.random.seed(seed)
 
     log.info(
-        "variant=%s device=%s buffer=%s warmup_steps=%d max_train_steps=%d",
+        "variant=%s device=%s bf16=%s buffer=%s warmup_steps=%d max_train_steps=%d",
         args.variant,
         device,
+        args.bf16,
         cfg.data.offline_buffer_path,
         int(cfg.training.warmup_steps),
         int(cfg.training.max_train_steps),
@@ -415,7 +476,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Stage 1 (warmup).
     metrics_log: list[dict] = []
-    metrics_log.extend(_run_stage1(worker, buf, cfg, args.variant, device))
+    metrics_log.extend(
+        _run_stage1(worker, buf, cfg, args.variant, device, use_bf16=args.bf16)
+    )
 
     # Freeze encoder for non-qrt variants.
     if args.variant != "qrt":
@@ -424,9 +487,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Stage 2.
     if args.variant == "rlt_online_sim":
-        metrics_log.extend(_stage2_online_sim(worker, buf, cfg, device))
+        metrics_log.extend(
+            _stage2_online_sim(worker, buf, cfg, device, use_bf16=args.bf16)
+        )
     else:
-        metrics_log.extend(_stage2_offline(worker, buf, cfg, args.variant))
+        metrics_log.extend(
+            _stage2_offline(worker, buf, cfg, args.variant, use_bf16=args.bf16)
+        )
 
     # Persist metrics + final ckpt.
     metrics_path = out_dir / "metrics.json"
