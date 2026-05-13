@@ -872,6 +872,57 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         )
         return prefix_output, prefix_pad_masks, past_key_values
 
+    @torch.no_grad()
+    def extract_embeddings(self, env_obs: dict) -> torch.Tensor:
+        """Final-layer VLM hidden states for σ-QRT RL token encoder input.
+
+        Takes a raw env observation dict (same format consumed by
+        `predict_action_batch`: ``main_images``, ``wrist_images``,
+        ``extra_view_images``, ``states``, ``task_descriptions``) and returns the
+        concatenated SigLIP image tokens + Gemma language tokens after the
+        PaliGemma backbone, as a ``[B, M, d]`` tensor.
+
+        The VLA is frozen in σ-QRT, so the returned tensor is ``.detach()``'d:
+        gradients computed by downstream modules (RL token encoder, Q-head)
+        cannot flow back into the SigLIP/Gemma weights.
+
+        Args:
+            env_obs: raw env observation dict.
+
+        Returns:
+            ``z`` of shape ``[B, M, d]`` (``d`` = Gemma hidden size, e.g. 2048
+            for π0.5's Gemma-2B backbone). Detached from the autograd graph.
+        """
+        was_training = self.training
+        self.eval()
+        try:
+            # 1. env_obs -> policy input obs (observation/image, observation/state, prompt, ...)
+            to_process_obs = self.obs_processor(env_obs)
+            # 2. policy input obs -> model input obs (tokenized_prompt, image, state, ...)
+            processed_obs = self.input_transform(to_process_obs, transpose=False)
+            # 3. move tensors to the model's device.
+            processed_obs = self.precision_processor(processed_obs)
+            # 4. dict -> Observation dataclass.
+            observation = _model.Observation.from_dict(processed_obs)
+            # 5. Observation -> (images, img_masks, lang_tokens, lang_masks, state)
+            images, img_masks, lang_tokens, lang_masks, _state = (
+                self._preprocess_observation(observation, train=False)
+            )
+            device = next(self.parameters()).device
+            images = [img.to(device) for img in images]
+            img_masks = [m.to(device) for m in img_masks]
+            lang_tokens = lang_tokens.to(device)
+            lang_masks = lang_masks.to(device)
+            # 6. _build_prefix_cache: returns the VLM final-layer hidden states
+            #    `prefix_output` shape [B, M, d] = SigLIP image tokens + Gemma language tokens.
+            prefix_output, _prefix_pad_masks, _past_key_values = (
+                self._build_prefix_cache(images, img_masks, lang_tokens, lang_masks)
+            )
+        finally:
+            if was_training:
+                self.train()
+        return prefix_output.detach()
+
     def _compute_value_from_suffix(self, suffix_out):
         """Compute value from suffix output using value head."""
         if self.config.chunk_critic_input:
