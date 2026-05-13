@@ -459,3 +459,78 @@ def compute_grpo_actor_loss_fn(**kwargs) -> tuple[torch.Tensor, dict]:
     metrics_data.update(actor_metrics_data)
 
     return actor_loss, metrics_data
+
+
+# ----------------------------------------------------------------------
+# σ-QRT losses (Q-aware RL Token, offline VLA RL)
+# Reference: work/hbz/sigma/sigma_pivot_v2_design.md §2.3, RLT paper Eq.2-5.
+# ----------------------------------------------------------------------
+
+
+def qrt_critic_loss(
+    q1: torch.Tensor, q2: torch.Tensor, q_target: torch.Tensor
+) -> torch.Tensor:
+    """σ-QRT critic loss = 0.5 * mean[(Q1 − target)² + (Q2 − target)²]. Twin Q (TD3)."""
+    q_target = q_target.detach()
+    return 0.5 * ((q1 - q_target) ** 2 + (q2 - q_target) ** 2).mean()
+
+
+def qrt_compute_target(
+    rewards: torch.Tensor,
+    q_next_target_min: torch.Tensor,
+    dones: torch.Tensor,
+    gamma: float,
+    chunk_len: int,
+) -> torch.Tensor:
+    """Chunked TD target (RLT Eq.3):
+
+        target = Σ_{t'=0}^{C-1} γ^{t'} · r_{t'+1}
+                + γ^C · (1 − done) · min_i Q_target(s', a')
+
+    Args:
+        rewards: [B, C] per-step reward inside the chunk.
+        q_next_target_min: [B] min over twin target Qs at next state.
+        dones: [B] terminal flag (1.0 = terminal, no bootstrap).
+        gamma: discount factor.
+        chunk_len: C = number of env steps inside an action chunk.
+
+    Returns:
+        [B] TD target.
+    """
+    device = rewards.device
+    dtype = rewards.dtype
+    gammas = torch.tensor(
+        [gamma**t for t in range(chunk_len)], device=device, dtype=dtype
+    )  # [C]
+    discounted_r = (rewards * gammas).sum(dim=-1)  # [B]
+    bootstrap = (gamma**chunk_len) * (1.0 - dones) * q_next_target_min
+    return discounted_r + bootstrap
+
+
+def qrt_actor_loss(
+    q: torch.Tensor,
+    actions: torch.Tensor,
+    ref_actions: torch.Tensor,
+    beta: float,
+) -> torch.Tensor:
+    """σ-QRT actor loss (RLT Eq.5 + Q normalization):
+
+        L_π = E[ -Q(s,a) / (|mean(Q)| + ε)  +  β · mean_{c, d}(a − ã)² ]
+
+    Args:
+        q: [B] scalar Q value (use min of twin Q in caller).
+        actions: [B, C, d_act] actor action chunk.
+        ref_actions: [B, C, d_act] VLA reference chunk.
+        beta: BC regularization strength.
+
+    Returns:
+        scalar loss.
+    """
+    q_norm = q.detach().abs().mean().clamp_min(1e-6)
+    bc = ((actions - ref_actions) ** 2).mean(dim=(-1, -2))  # [B]
+    return (-q / q_norm + beta * bc).mean()
+
+
+def rlt_recon_loss(z_hat: torch.Tensor, z_target: torch.Tensor) -> torch.Tensor:
+    """RLT Eq.2 per-token MSE: ‖ ẑ − sg(z) ‖² averaged."""
+    return ((z_hat - z_target.detach()) ** 2).mean()
