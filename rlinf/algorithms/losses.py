@@ -515,7 +515,7 @@ def qrt_actor_loss(
 ) -> torch.Tensor:
     """σ-QRT actor loss (RLT Eq.5 + Q normalization):
 
-        L_π = E[ -Q(s,a) / (|mean(Q)| + ε)  +  β · mean_{c, d}(a − ã)² ]
+        L_π = E[ -Q(s,a) / (|mean(Q)| + ε)  +  β · sum_{c, d}(a − ã)² ]
 
     Args:
         q: [B] scalar Q value (use min of twin Q in caller).
@@ -527,7 +527,7 @@ def qrt_actor_loss(
         scalar loss.
     """
     q_norm = q.detach().abs().mean().clamp_min(1e-6)
-    bc = ((actions - ref_actions) ** 2).mean(dim=(-1, -2))  # [B]
+    bc = ((actions - ref_actions) ** 2).sum(dim=(-1, -2))  # [B]
     return (-q / q_norm + beta * bc).mean()
 
 
