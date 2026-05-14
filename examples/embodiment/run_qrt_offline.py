@@ -32,6 +32,14 @@ Outputs
 - ``<output_dir>/metrics.json``: list of per-log-interval metric dicts.
 - ``<output_dir>/ckpt.pt``: encoder + decoder + actor + critic state dicts
   + the resolved config (for eval-time reload).
+- ``<output_dir>/ckpt_step{N}.pt``: intermediate Stage-2 snapshots written
+  every ``--save_interval`` steps (default 2000; set ``--save_interval -1``
+  or ``0`` to disable). Same payload as the final ckpt — used by
+  ``periodic_eval_watcher.py`` for learning-curve eval.
+- ``<output_dir>/ckpt_latest.pt``: copy of the most recent intermediate
+  ckpt (for "best-so-far" inspection).
+- ``<output_dir>/.training_done``: empty sentinel touched at the end of
+  ``main()`` so external watchers know to drain + exit.
 
 Usage
 -----
@@ -235,6 +243,49 @@ class _NullCtx:
         return False
 
 
+# --------------------------------------------------------------------------- #
+# Ckpt I/O — atomic write so the periodic_eval_watcher never sees a partial
+# file. Pattern: torch.save → .tmp; os.replace(.tmp, final). os.replace is
+# atomic on POSIX + Windows for same-filesystem renames.
+# --------------------------------------------------------------------------- #
+def _build_ckpt(worker, cfg, variant: str) -> dict:
+    return {
+        "encoder": worker.encoder.state_dict(),
+        "decoder": worker.decoder.state_dict(),
+        "actor": worker.actor.state_dict(),
+        "critic": worker.critic.state_dict(),
+        "cfg": OmegaConf.to_container(cfg, resolve=True),
+        "variant": variant,
+    }
+
+
+def _atomic_torch_save(payload: dict, dest: Path) -> None:
+    """torch.save to ``dest.tmp`` then os.replace → atomic for watchers."""
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    torch.save(payload, tmp)
+    import os as _os
+
+    _os.replace(tmp, dest)
+
+
+def _save_intermediate_ckpt(
+    worker, cfg, variant: str, out_dir: Path, step: int
+) -> None:
+    """Write ``ckpt_step{step}.pt`` + refresh ``ckpt_latest.pt`` atomically.
+
+    Step numbering uses the 1-based "completed step" count so the first
+    interval boundary at ``--save_interval N`` produces ``ckpt_stepN.pt``.
+    """
+    payload = _build_ckpt(worker, cfg, variant)
+    step_path = out_dir / f"ckpt_step{step}.pt"
+    latest_path = out_dir / "ckpt_latest.pt"
+    _atomic_torch_save(payload, step_path)
+    # latest = same payload, separate atomic write so partial reads can't
+    # mix old/new bytes.
+    _atomic_torch_save(payload, latest_path)
+    log.info("saved intermediate ckpt step=%d → %s", step, step_path.name)
+
+
 def _run_stage1(
     worker, buf, cfg, variant: str, device: str, use_bf16: bool = False
 ) -> list[dict]:
@@ -277,21 +328,34 @@ def _run_stage1(
 # Stage 2 (joint or actor-critic only)
 # --------------------------------------------------------------------------- #
 def _stage2_offline(
-    worker, buf, cfg, variant: str, use_bf16: bool = False
+    worker,
+    buf,
+    cfg,
+    variant: str,
+    use_bf16: bool = False,
+    save_interval: int = 0,
+    out_dir: Path | None = None,
 ) -> list[dict]:
-    """Offline Stage 2 loop for qrt + a1_frozen_encoder."""
+    """Offline Stage 2 loop for qrt + a1_frozen_encoder.
+
+    When ``save_interval > 0`` and ``out_dir`` is provided, an intermediate
+    ckpt is written every ``save_interval`` completed steps. The first
+    intermediate snapshot is written after step ``save_interval - 1`` runs
+    (i.e. when ``(step + 1) % save_interval == 0``) so the snapshot filename
+    ``ckpt_step{N}.pt`` matches the number of training steps that produced
+    it.
+    """
     metrics: list[dict] = []
     log_iv = int(cfg.logging.get("log_interval", 100))
     batch_size = int(cfg.training.batch_size)
     max_steps = int(cfg.training.max_train_steps)
+    do_save = save_interval and save_interval > 0 and out_dir is not None
     for step in range(max_steps):
         batch = buf.sample(num_chunks=batch_size)
         adapted = adapt_buffer_batch(batch)
         adapted = _move_to_device_async(adapted, worker.device)
         if use_bf16 and adapted["z_obs"].is_cuda:
-            autocast_ctx = torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16
-            )
+            autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         else:
             autocast_ctx = _NullCtx()
         with autocast_ctx:
@@ -311,11 +375,20 @@ def _stage2_offline(
                 m.get("loss_actor", float("nan")),
                 m.get("q_mean", float("nan")),
             )
+        if do_save and (step + 1) % save_interval == 0 and (step + 1) < max_steps:
+            _save_intermediate_ckpt(worker, cfg, variant, out_dir, step + 1)
     return metrics
 
 
 def _stage2_online_sim(
-    worker, buf, cfg, _device: str, use_bf16: bool = False
+    worker,
+    buf,
+    cfg,
+    _device: str,
+    use_bf16: bool = False,
+    save_interval: int = 0,
+    out_dir: Path | None = None,
+    variant: str = "rlt_online_sim",
 ) -> list[dict]:
     """Online Stage 2: env rollout interleaved with stage2_step.
 
@@ -349,6 +422,7 @@ def _stage2_online_sim(
     # Cadence: collect 1 episode every `cfg.training.rollout_interval` steps.
     rollout_iv = int(cfg.training.get("rollout_interval", 100))
     z_obs_dtype = str(cfg.training.get("save_z_obs_dtype", "bfloat16"))
+    do_save = save_interval and save_interval > 0 and out_dir is not None
 
     for step in range(max_steps):
         if step > 0 and step % rollout_iv == 0:
@@ -389,6 +463,8 @@ def _stage2_online_sim(
                 m.get("loss_critic", float("nan")),
                 m.get("loss_actor", float("nan")),
             )
+        if do_save and (step + 1) % save_interval == 0 and (step + 1) < max_steps:
+            _save_intermediate_ckpt(worker, cfg, variant, out_dir, step + 1)
     return metrics
 
 
@@ -427,6 +503,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "cores). bf16 has the same 8-bit exponent range as fp32, so no "
             "GradScaler is needed. Recommended for paper-faithful runs on "
             "GPU; CPU smoke tests should leave this off."
+        ),
+    )
+    p.add_argument(
+        "--save_interval",
+        type=int,
+        default=2000,
+        help=(
+            "Save an intermediate ckpt every N Stage-2 steps "
+            "(``<output_dir>/ckpt_step{N}.pt``) plus a refreshed "
+            "``ckpt_latest.pt`` snapshot. Set to ``-1`` or ``0`` to disable "
+            "(only the final ``ckpt.pt`` is written). Default 2000."
         ),
     )
     return p.parse_args(argv)
@@ -485,29 +572,53 @@ def main(argv: list[str] | None = None) -> int:
         worker.freeze_encoder()
         log.info("encoder frozen (variant=%s)", args.variant)
 
-    # Stage 2.
+    # Stage 2. Pass save_interval + out_dir so intermediate snapshots can be
+    # written; the helper short-circuits when save_interval <= 0.
+    save_interval = int(args.save_interval)
+    log.info(
+        "stage2 save_interval=%d (intermediate ckpts %s)",
+        save_interval,
+        "ENABLED" if save_interval > 0 else "disabled",
+    )
     if args.variant == "rlt_online_sim":
         metrics_log.extend(
-            _stage2_online_sim(worker, buf, cfg, device, use_bf16=args.bf16)
+            _stage2_online_sim(
+                worker,
+                buf,
+                cfg,
+                device,
+                use_bf16=args.bf16,
+                save_interval=save_interval,
+                out_dir=out_dir,
+                variant=args.variant,
+            )
         )
     else:
         metrics_log.extend(
-            _stage2_offline(worker, buf, cfg, args.variant, use_bf16=args.bf16)
+            _stage2_offline(
+                worker,
+                buf,
+                cfg,
+                args.variant,
+                use_bf16=args.bf16,
+                save_interval=save_interval,
+                out_dir=out_dir,
+            )
         )
 
     # Persist metrics + final ckpt.
     metrics_path = out_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics_log, indent=2))
 
-    ckpt = {
-        "encoder": worker.encoder.state_dict(),
-        "decoder": worker.decoder.state_dict(),
-        "actor": worker.actor.state_dict(),
-        "critic": worker.critic.state_dict(),
-        "cfg": OmegaConf.to_container(cfg, resolve=True),
-        "variant": args.variant,
-    }
-    torch.save(ckpt, out_dir / "ckpt.pt")
+    ckpt = _build_ckpt(worker, cfg, args.variant)
+    _atomic_torch_save(ckpt, out_dir / "ckpt.pt")
+    # Also refresh ckpt_latest.pt so consumers always have a "latest" handle
+    # whether they're using interval snapshots or not.
+    _atomic_torch_save(ckpt, out_dir / "ckpt_latest.pt")
+
+    # .training_done sentinel — signals periodic_eval_watcher.py to drain
+    # any remaining un-evaluated ckpt_step*.pt files and exit cleanly.
+    (out_dir / ".training_done").touch()
 
     log.info(
         "done. metrics=%s ckpt=%s n_log_entries=%d",
