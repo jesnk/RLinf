@@ -249,7 +249,7 @@ class _NullCtx:
 # atomic on POSIX + Windows for same-filesystem renames.
 # --------------------------------------------------------------------------- #
 def _build_ckpt(worker, cfg, variant: str) -> dict:
-    return {
+    payload = {
         "encoder": worker.encoder.state_dict(),
         "decoder": worker.decoder.state_dict(),
         "actor": worker.actor.state_dict(),
@@ -257,6 +257,12 @@ def _build_ckpt(worker, cfg, variant: str) -> dict:
         "cfg": OmegaConf.to_container(cfg, resolve=True),
         "variant": variant,
     }
+    # IQL variant: persist V network so reloads (e.g. periodic eval) can
+    # reconstruct the full agent. v_net is None for TD3+BC.
+    v_net = getattr(worker, "v_net", None)
+    if v_net is not None:
+        payload["v_net"] = v_net.state_dict()
+    return payload
 
 
 def _atomic_torch_save(payload: dict, dest: Path) -> None:
@@ -368,13 +374,27 @@ def _stage2_offline(
         m["step"] = step
         if step % log_iv == 0 or step == max_steps - 1:
             metrics.append(m)
-            log.info(
-                "stage2 step=%d loss_critic=%.4f loss_actor=%.4f q_mean=%.4f",
-                step,
-                m.get("loss_critic", float("nan")),
-                m.get("loss_actor", float("nan")),
-                m.get("q_mean", float("nan")),
-            )
+            if "loss_v" in m:
+                log.info(
+                    "stage2[iql] step=%d loss_q=%.4f loss_v=%.4f loss_actor=%.4f "
+                    "q_mean=%.4f v_mean=%.4f adv=%.4f w=%.4f",
+                    step,
+                    m.get("loss_critic", float("nan")),
+                    m.get("loss_v", float("nan")),
+                    m.get("loss_actor", float("nan")),
+                    m.get("q_mean", float("nan")),
+                    m.get("v_mean", float("nan")),
+                    m.get("advantage_mean", float("nan")),
+                    m.get("weight_mean", float("nan")),
+                )
+            else:
+                log.info(
+                    "stage2 step=%d loss_critic=%.4f loss_actor=%.4f q_mean=%.4f",
+                    step,
+                    m.get("loss_critic", float("nan")),
+                    m.get("loss_actor", float("nan")),
+                    m.get("q_mean", float("nan")),
+                )
         if do_save and (step + 1) % save_interval == 0 and (step + 1) < max_steps:
             _save_intermediate_ckpt(worker, cfg, variant, out_dir, step + 1)
     return metrics
@@ -495,6 +515,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument(
+        "--use_iql",
+        action="store_true",
+        help=(
+            "Activate the σ-QRT IQL variant: V-network + expectile regression "
+            "+ advantage-weighted actor BC. Avoids Q-extrapolation collapse "
+            "seen in TD3+BC β sweep Phase 1. Sets cfg.training.use_iql=true "
+            "and requires the IQL hparams (iql_tau, iql_beta, iql_weight_clip) "
+            "in cfg.training — see configs/libero_long_qrt_iql_*.yaml."
+        ),
+    )
+    p.add_argument(
         "--bf16",
         action="store_true",
         help=(
@@ -523,6 +554,12 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     cfg = OmegaConf.load(args.config)
     apply_overrides(cfg, args.override)
+
+    # CLI --use_iql wins over yaml; preserves yaml's use_iql=true if set.
+    if args.use_iql:
+        if "training" not in cfg:
+            cfg.training = {}
+        cfg.training.use_iql = True
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
