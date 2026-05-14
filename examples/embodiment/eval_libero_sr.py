@@ -189,6 +189,22 @@ def _maybe_load_worker(cfg, ckpt_path: str | None, device: str):
         worker.decoder.load_state_dict(payload["decoder"])
     if "critic" in payload:
         worker.critic.load_state_dict(payload["critic"])
+    # Honor training-time residual-actor flag from the saved cfg, in case the
+    # caller's yaml/override doesn't set it. Eval-side actor call branches on
+    # worker.use_residual_actor so this flag MUST match training. Falls back
+    # to whatever the constructor cfg said (back-compat for non-residual ckpts).
+    saved_cfg = payload.get("cfg")
+    if isinstance(saved_cfg, dict):
+        try:
+            tr = saved_cfg.get("training", {})
+            if "use_residual_actor" in tr:
+                worker.use_residual_actor = bool(tr["use_residual_actor"])
+                log.info(
+                    "ckpt cfg → use_residual_actor=%s",
+                    worker.use_residual_actor,
+                )
+        except Exception as e:
+            log.warning("failed to read residual flag from payload cfg: %s", e)
     worker.encoder.eval()
     worker.actor.eval()
     for p in worker.encoder.parameters():
@@ -233,7 +249,13 @@ def _eval_one_episode(
                 z_rl = worker.encoder(z)
                 s_p = _proprio_from_obs(obs).unsqueeze(0).to(device)
                 ref_in = ref_chunk.unsqueeze(0).to(device)  # [1, C, A]
-                refined = worker.actor(z_rl, s_p, ref_in, training=False)[0].cpu()
+                if getattr(worker, "use_residual_actor", False):
+                    delta = worker.actor(
+                        z_rl, s_p, ref_in, training=False, residual=True
+                    )
+                    refined = (ref_in + delta)[0].cpu()
+                else:
+                    refined = worker.actor(z_rl, s_p, ref_in, training=False)[0].cpu()
                 action_chunk = refined
             else:
                 action_chunk = ref_chunk.cpu()
@@ -572,7 +594,15 @@ def _run_async_eval(args, cfg, device: str, max_episode_len: int) -> dict:
                         .to(device)
                     )
                     ref_in = ref_chunk.unsqueeze(0).to(device)
-                    refined = worker.actor(z_rl, s_p, ref_in, training=False)[0].cpu()
+                    if getattr(worker, "use_residual_actor", False):
+                        delta = worker.actor(
+                            z_rl, s_p, ref_in, training=False, residual=True
+                        )
+                        refined = (ref_in + delta)[0].cpu()
+                    else:
+                        refined = worker.actor(z_rl, s_p, ref_in, training=False)[
+                            0
+                        ].cpu()
                     action_chunk_cpu = refined
                 else:
                     action_chunk_cpu = ref_chunk.cpu()

@@ -73,6 +73,16 @@ training:
                               # weighting. Typical sweep {3, 10, 30}.
   iql_weight_clip: 100.0      # exp(β·adv) clamp for numerical stability.
 
+  # ----- G2 residual-actor variant (off by default; opt in per-launcher) -----
+  # When use_residual_actor=true:
+  #   a_pred = ref_action + Δ_θ(z_rl, s_p, ref_action)   [Δ from actor.forward(residual=True)]
+  #   L_actor = E[w(s,a)·‖Δ‖²] + α·-Q1(s, a_pred) + λ·‖Δ‖²
+  # SR floor = B0 (π0.5 alone) is structurally guaranteed by Δ→0.
+  # See worker module docstring for derivation.
+  use_residual_actor: false   # G2 flag — flip on in launchers / overrides.
+  residual_alpha: 0.1         # Q-max term weight (α). Larger → more aggressive correction.
+  residual_reg: 0.0           # Optional L2 on Δ. 0 disables.
+
 env:
   name: libero_long
   num_tasks: 10

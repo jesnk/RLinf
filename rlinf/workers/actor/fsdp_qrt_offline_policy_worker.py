@@ -119,7 +119,19 @@ class _ActorMLP(nn.Module):
         s_p: torch.Tensor,
         ref_action: torch.Tensor,
         training: bool = True,
+        residual: bool = False,
     ) -> torch.Tensor:
+        """Standard mode (residual=False): output absolute action chunk μ_θ(s).
+
+        Residual mode (residual=True): output a *correction* Δ_θ(s) only.
+        Caller is responsible for forming a_pred = ref_action + Δ. Used by
+        the σ-QRT G2 residual-actor variant — the actor's job shrinks to
+        learning a small delta on top of π0.5's reference, with BC fidelity
+        guaranteed by the ref anchor and Q signal driving the delta. No
+        Gaussian noise is added in residual mode (training noise breaks the
+        clean a_pred = ref + Δ semantics; AWR weighting + Q-max term carry
+        the exploration pressure instead).
+        """
         if training and self.ref_action_dropout > 0:
             mask = (
                 torch.rand(ref_action.shape[0], 1, 1, device=ref_action.device)
@@ -129,7 +141,11 @@ class _ActorMLP(nn.Module):
         else:
             ref = ref_action
         x = torch.cat([z_rl, s_p, ref.flatten(start_dim=1)], dim=-1)
-        mu = self.net(x).view(-1, self.chunk_len, self.action_dim)
+        out = self.net(x).view(-1, self.chunk_len, self.action_dim)
+        if residual:
+            # Caller adds ref_action externally. No noise in residual mode.
+            return out
+        mu = out
         if training:
             return mu + torch.randn_like(mu) * self.action_std
         return mu
@@ -220,6 +236,15 @@ class QRTOfflinePolicyWorker:
         self.iql_tau = float(tr.get("iql_tau", 0.7))
         self.iql_beta = float(tr.get("iql_beta", 3.0))
         self.iql_weight_clip = float(tr.get("iql_weight_clip", 100.0))
+
+        # G2 residual-actor variant (only used when use_iql=True). Actor
+        # learns a small correction Δ on top of π0.5's reference action;
+        # SR floor = B0 (ref alone) is structurally guaranteed by the
+        # anchor, and the Q-max term lets the actor improve where the
+        # critic is reliable. See work/hbz/sigma section "G2 residual".
+        self.use_residual_actor = bool(tr.get("use_residual_actor", False))
+        self.residual_alpha = float(tr.get("residual_alpha", 0.1))
+        self.residual_reg = float(tr.get("residual_reg", 0.0))
         if self.use_iql:
             v_hidden = int(m.get("v_hidden", m.critic_hidden))
             v_layers = int(m.get("v_layers", m.critic_layers))
@@ -438,22 +463,65 @@ class QRTOfflinePolicyWorker:
 
         # ----- (3) Actor update: advantage-weighted regression -----
         z_rl_a = self.encoder(z_obs)
-        # Deterministic mean output (training=False → no ref dropout, no noise).
-        mu_actor = self.actor(z_rl_a, s_p, ref_action, training=False)
         with torch.no_grad():
             # Advantage uses Q_target on the dataset action — no OOD query.
             q_for_adv = (
                 self._q(z_rl_a.detach(), s_p, action, target=True).min(dim=-1).values
             )
             v_for_adv = self.v_net(z_rl_a.detach(), s_p)
-        loss_a = qrt_iql_actor_loss(
-            actions=action,
-            mu_actor=mu_actor,
-            q_target=q_for_adv,
-            v_pred=v_for_adv,
-            beta_iql=self.iql_beta,
-            weight_clip=self.iql_weight_clip,
-        )
+
+        if self.use_residual_actor:
+            # G2 residual actor:
+            #   Δ      = actor(z_rl, s_p, ref_action)  [residual=True → noise off]
+            #   a_pred = ref_action + Δ
+            #   L_AWR  = exp(β·A).clamp(max=w_clip) * ‖Δ‖² (anchors Δ→0 with BC pressure)
+            #   L_Qmax = α · -Q1(s, a_pred)              (pushes Δ to maximize Q)
+            #   L_reg  = λ · ‖Δ‖²                         (optional, defaults to 0)
+            # ref_action serves as the anchor because at eval time only the live
+            # π0.5 reference is available (no buffer); using ref_action here keeps
+            # train/eval semantics aligned (action == ref_action for offline π0.5
+            # data anyway, verified at impl time).
+            delta = self.actor(z_rl_a, s_p, ref_action, training=False, residual=True)
+            a_pred = ref_action + delta
+            # Δ_squared per-sample (matches qrt_iql_actor_loss sum-norm convention).
+            delta_sq = (delta**2).sum(dim=(-1, -2))  # [B]
+            advantage = q_for_adv - v_for_adv  # [B], detached above
+            weight = torch.exp(self.iql_beta * advantage).clamp(
+                max=self.iql_weight_clip
+            )
+            loss_awr = (weight * delta_sq).mean()
+
+            # Q-max term: pushes Δ in the gradient direction of Q1. Use first
+            # Q head (q_id=0) — twin Qs are for critic robustness; gradient
+            # signal needs just one head, plus min would zero out gradients
+            # through the non-min head.
+            state_feat_a = torch.cat([z_rl_a, s_p], dim=-1)
+            a_pred_feat = a_pred.flatten(start_dim=1)
+            q1_for_max = self.critic.q_id_forward(0, state_feat_a, a_pred_feat).squeeze(
+                -1
+            )
+            loss_qmax = -q1_for_max.mean()
+
+            loss_reg = (delta**2).mean() if self.residual_reg > 0 else 0.0
+            loss_a = (
+                loss_awr
+                + self.residual_alpha * loss_qmax
+                + self.residual_reg * loss_reg
+            )
+            # mu_actor surrogate for downstream metrics naming consistency.
+            mu_actor = a_pred
+        else:
+            # Standard IQL actor: deterministic mean output (training=False
+            # → no ref dropout, no noise).
+            mu_actor = self.actor(z_rl_a, s_p, ref_action, training=False)
+            loss_a = qrt_iql_actor_loss(
+                actions=action,
+                mu_actor=mu_actor,
+                q_target=q_for_adv,
+                v_pred=v_for_adv,
+                beta_iql=self.iql_beta,
+                weight_clip=self.iql_weight_clip,
+            )
 
         self.opt_actor.zero_grad(set_to_none=True)
         self.opt_enc.zero_grad(set_to_none=True)
@@ -481,7 +549,7 @@ class QRTOfflinePolicyWorker:
             weight = torch.exp(self.iql_beta * advantage).clamp(
                 max=self.iql_weight_clip
             )
-        return {
+        out_metrics = {
             "loss_critic": float(loss_q.detach().item()),
             "loss_actor": float(loss_a.detach().item()),
             "loss_recon": float(loss_recon.detach().item()),
@@ -491,3 +559,11 @@ class QRTOfflinePolicyWorker:
             "advantage_mean": float(advantage.mean().item()),
             "weight_mean": float(weight.mean().item()),
         }
+        if self.use_residual_actor:
+            with torch.no_grad():
+                # delta is in scope from the residual branch above.
+                delta_norm = delta.detach().pow(2).sum(dim=(-1, -2)).sqrt().mean()
+                out_metrics["delta_norm"] = float(delta_norm.item())
+                out_metrics["loss_awr"] = float(loss_awr.detach().item())
+                out_metrics["loss_qmax"] = float(loss_qmax.detach().item())
+        return out_metrics
