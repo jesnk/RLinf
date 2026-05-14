@@ -1,5 +1,5 @@
 #!/bin/bash
-# σ-QRT IQL chain v6_v2 launcher (warmup=10000, max_train=5000): A1 frozen-encoder vs σ-QRT joint-encoder under IQL.
+# σ-QRT IQL chain v6_v2 launcher (warmup=10000, max_train=10000): A1 frozen-encoder vs σ-QRT joint-encoder under IQL.
 #
 # Goal
 # ----
@@ -67,7 +67,7 @@ run_lane() {
             --override "data.capacity=8000" \
             --override "training.batch_size=128" \
             --override "training.warmup_steps=10000" \
-            --override "training.max_train_steps=5000" \
+            --override "training.max_train_steps=10000" \
             --override "training.iql_tau=${TAU}" \
             --override "training.iql_beta=${BETA}" \
             --override "seed=${SEED}" \
