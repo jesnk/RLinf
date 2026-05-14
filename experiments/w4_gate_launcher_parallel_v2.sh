@@ -69,6 +69,7 @@ run_lane() {
                 --config ${CFG} \
                 --ckpt ${LANE_OUT}/ckpt.pt \
                 --num_eval 50 \
+                --num_envs 5 \
                 --seed 1 \
                 --output ${LANE_OUT}/eval_sr.json \
                 > ${LANE_TAG}_eval.log 2>&1
@@ -97,6 +98,7 @@ run_b0() {
         python examples/embodiment/eval_libero_sr.py \
             --config ${CFG} \
             --num_eval 50 \
+            --num_envs 5 \
             --seed 1 \
             --output ${LANE_OUT}/eval_sr.json \
             > ${LANE_TAG}_eval.log 2>&1
