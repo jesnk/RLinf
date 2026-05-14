@@ -26,6 +26,12 @@ Variants
   paper-faithful frozen-encoder protocol.
 - ``rlt_online_sim``: paper-faithful B2 baseline. Stage 1 + freeze_encoder
   + Stage 2 with env rollouts interleaved. Online RL with frozen encoder.
+- ``a1_raw_features``: σ-QRT v7 Goal 1 bypass ablation. Stage 1 SKIPPED.
+  Stage 2 runs IQL but replaces ``encoder(z_obs)`` with mean-pooled raw
+  VLA features (identity dim handling when ``cfg.model.token_dim`` equals
+  the VLA hidden dim — default for π0.5 Gemma 2048 = 2048). Tests whether
+  the RLT encoder is necessary; if SR ≥ A1, encoder is a bottleneck.
+  Requires ``--use_iql`` (or ``cfg.training.use_iql=true``).
 
 Outputs
 -------
@@ -186,6 +192,15 @@ def _build_worker(cfg, variant: str, device: str):
         )
 
         worker = RLTOnlineSimWorker(cfg, device=device)
+    elif variant == "a1_raw_features":
+        # σ-QRT v7 Goal 1: bypass-encoder ablation. IQL only — TD3+BC path
+        # would need a separate bypass worker class. Entry script skips
+        # Stage 1 for this variant (see main()).
+        from rlinf.workers.actor.fsdp_raw_features_iql_worker import (
+            RawFeaturesIQLWorker,
+        )
+
+        worker = RawFeaturesIQLWorker(cfg, device=device)
     else:
         raise ValueError(f"unknown variant {variant!r}")
     worker.setup()
@@ -504,7 +519,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--variant",
-        choices=["qrt", "a1_frozen_encoder", "rlt_online_sim"],
+        choices=["qrt", "a1_frozen_encoder", "rlt_online_sim", "a1_raw_features"],
         default="qrt",
     )
     p.add_argument(
@@ -598,13 +613,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     log.info("buffer loaded: %d trajectories", len(buf))
 
-    # Stage 1 (warmup).
+    # Stage 1 (warmup). Skipped for a1_raw_features (encoder bypassed; no
+    # representation to train against recon loss).
     metrics_log: list[dict] = []
-    metrics_log.extend(
-        _run_stage1(worker, buf, cfg, args.variant, device, use_bf16=args.bf16)
-    )
+    if args.variant == "a1_raw_features":
+        log.info("variant=a1_raw_features → Stage 1 token warmup SKIPPED")
+    else:
+        metrics_log.extend(
+            _run_stage1(worker, buf, cfg, args.variant, device, use_bf16=args.bf16)
+        )
 
-    # Freeze encoder for non-qrt variants.
+    # Freeze encoder for non-qrt variants. For a1_raw_features the encoder
+    # is already bypassed (and frozen at random init) since worker.setup(),
+    # so freeze_encoder() is a no-op — but call it for uniformity.
     if args.variant != "qrt":
         worker.freeze_encoder()
         log.info("encoder frozen (variant=%s)", args.variant)
