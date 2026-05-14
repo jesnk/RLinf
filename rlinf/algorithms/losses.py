@@ -534,3 +534,122 @@ def qrt_actor_loss(
 def rlt_recon_loss(z_hat: torch.Tensor, z_target: torch.Tensor) -> torch.Tensor:
     """RLT Eq.2 per-token MSE: ‖ ẑ − sg(z) ‖² averaged."""
     return ((z_hat - z_target.detach()) ** 2).mean()
+
+
+# ----------------------------------------------------------------------
+# σ-QRT IQL variant losses
+# Reference: Kostrikov et al. 2021 (Implicit Q-Learning).
+#
+# IQL avoids querying Q on OOD actions (which causes Q-extrapolation
+# collapse in TD3+BC actor) by introducing a state-value network V_φ
+# trained via expectile regression to approximate max_a Q. The Q network
+# then bootstraps off V(s'), and the actor learns via advantage-weighted
+# regression — both updates only ever query Q at dataset actions.
+# ----------------------------------------------------------------------
+
+
+def qrt_iql_v_loss(
+    q_target: torch.Tensor, v_pred: torch.Tensor, tau: float = 0.7
+) -> torch.Tensor:
+    """IQL expectile-V loss.
+
+    L_τ(u) = |τ − 1[u < 0]| · u²    (asymmetric L2)
+    L_V = mean[L_τ(Q_target(s,a) − V_φ(s))]
+
+    τ ∈ (0.5, 1) — higher τ → upper expectile → V approximates max_a Q.
+    τ = 0.5 recovers standard MSE.
+
+    Args:
+        q_target: [B] min over twin target Qs at current (s, a). The .detach()
+            call is applied internally so that V_φ is the only grad target.
+        v_pred: [B] V_φ(s) prediction (gradient flows here).
+        tau: expectile in (0.5, 1).
+
+    Returns:
+        scalar loss.
+    """
+    diff = q_target.detach() - v_pred
+    weight = torch.where(diff < 0, 1.0 - tau, tau)
+    return (weight * diff.pow(2)).mean()
+
+
+def qrt_iql_q_loss(
+    q1: torch.Tensor,
+    q2: torch.Tensor,
+    rewards: torch.Tensor,
+    v_next: torch.Tensor,
+    dones: torch.Tensor,
+    gamma: float,
+    chunk_len: int,
+) -> torch.Tensor:
+    """IQL Q loss with chunked TD target bootstrapped by V(s') (not Q(s', a')).
+
+    target = Σ_{t'=0}^{C-1} γ^{t'} · r_{t'+1}
+            + γ^C · (1 − done) · V_φ(s')
+
+    The crucial difference from TD3+BC: the bootstrap term uses V_φ(s'),
+    which only depends on s' (no action input) → Q is never queried on a
+    potentially OOD action a' = π_target(s'), which is what was causing
+    the negative q_mean collapse in the σ-QRT β sweep Phase 1.
+
+    Args:
+        q1, q2: [B] twin Q at current (s, a).
+        rewards: [B, C] per-step reward inside the chunk.
+        v_next: [B] V_φ(s') prediction — detached internally.
+        dones: [B] terminal flag.
+        gamma: discount factor.
+        chunk_len: C = number of env steps inside an action chunk.
+
+    Returns:
+        scalar loss.
+    """
+    device = rewards.device
+    dtype = rewards.dtype
+    gammas = torch.tensor(
+        [gamma**t for t in range(chunk_len)], device=device, dtype=dtype
+    )  # [C]
+    discounted_r = (rewards * gammas).sum(dim=-1)  # [B]
+    bootstrap = (gamma**chunk_len) * (1.0 - dones) * v_next.detach()
+    target = discounted_r + bootstrap
+    return 0.5 * ((q1 - target).pow(2) + (q2 - target).pow(2)).mean()
+
+
+def qrt_iql_actor_loss(
+    actions: torch.Tensor,
+    mu_actor: torch.Tensor,
+    q_target: torch.Tensor,
+    v_pred: torch.Tensor,
+    beta_iql: float = 3.0,
+    weight_clip: float = 100.0,
+) -> torch.Tensor:
+    """IQL advantage-weighted regression (AWR) actor loss.
+
+    For a deterministic Gaussian actor with fixed std, maximizing the
+    AWR objective E[w(s,a) · log π_θ(a|s)] reduces (up to constants) to
+    weighted BC on the dataset action:
+
+        w(s,a) = exp(β_iql · (Q_target(s,a) − V_φ(s))).clamp(max=w_max)
+        L_π    = E[ w(s,a) · ‖ a_data − μ_θ(s, ref_action) ‖² ]
+
+    The σ-QRT-specific .sum(dim=(-1, -2)) BC norm (per "qrt_actor_loss BC
+    normalization mean→sum" fix) is preserved so β_iql magnitudes match
+    the TD3+BC regime intuitively.
+
+    Args:
+        actions: [B, C, d_act] dataset action chunk (target for regression).
+        mu_actor: [B, C, d_act] deterministic actor mean — pass the actor's
+            ``training=False`` output so noise is excluded (matches eval).
+        q_target: [B] min Q at (s, a_dataset), detached internally.
+        v_pred: [B] V_φ(s), detached internally.
+        beta_iql: AWR temperature. Higher → more peaked advantage weighting.
+            Typical {3, 10, 30}. Separate from TD3+BC β_bc.
+        weight_clip: upper clip on advantage weight (numerical stability —
+            prevents a single high-advantage sample from dominating).
+
+    Returns:
+        scalar loss.
+    """
+    advantage = q_target.detach() - v_pred.detach()  # [B]
+    weight = torch.exp(beta_iql * advantage).clamp(max=weight_clip)  # [B]
+    bc_err = ((actions - mu_actor) ** 2).sum(dim=(-1, -2))  # [B]
+    return (weight * bc_err).mean()
