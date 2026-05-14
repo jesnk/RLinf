@@ -278,33 +278,329 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Repeatable OmegaConf override.",
     )
     p.add_argument("--device", type=str, default=None)
+    p.add_argument(
+        "--num_envs",
+        type=int,
+        default=1,
+        help=(
+            "Number of parallel env worker subprocesses. 1 = sequential "
+            "(backwards compat path). N>1 = async pattern: N env workers "
+            "feed a central VLA/worker inference server via mp.Queue."
+        ),
+    )
     return p.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv)
-    cfg = OmegaConf.load(args.config)
-    apply_overrides(cfg, args.override)
+# --------------------------------------------------------------------------- #
+# Async path: per-env subprocess workers + central inference server
+# --------------------------------------------------------------------------- #
+def _env_worker(
+    env_id: int,
+    env_cfg_dict: dict,
+    max_episode_len: int,
+    seed: int,
+    chunk_len: int,
+    action_dim: int,
+    num_tasks: int,
+    max_episodes: int,
+    total_num_workers: int,
+    req_queue,
+    resp_queue,
+    result_queue,
+    log_level: int,
+) -> None:
+    """Run autonomous episode loop for one env, talking to the main
+    inference server via queues.
 
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    max_episode_len = int(
-        args.max_episode_len
-        if args.max_episode_len is not None
-        else cfg.env.get("max_episode_len", 600)
+    Per-message protocol:
+      req_queue.put((env_id, obs_for_vla_dict, proprio_np))
+      resp_queue.get() -> numpy.ndarray of shape [chunk_len, action_dim]
+
+    Per result:
+      result_queue.put({"env_id", "ep_idx", "success", "steps", "task_id"})
+    """
+    # Bootstrap inside the subprocess — needed because robosuite/MuJoCo
+    # doesn't fork cleanly. CUDA_VISIBLE_DEVICES + MUJOCO_EGL_DEVICE_ID
+    # are inherited from main via spawn.
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _sigma_qrt_helpers import bootstrap_gl_env
+
+    bootstrap_gl_env()
+    import logging as _logging
+
+    _logging.basicConfig(
+        format=f"[env_worker {env_id}] %(asctime)s %(levelname)s %(message)s",
+        level=log_level,
+        datefmt="%H:%M:%S",
     )
+    _log = _logging.getLogger(f"env_worker_{env_id}")
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # Re-import torch/np inside the subprocess.
+    import numpy as _np  # noqa: F811
+    import torch as _torch  # noqa: F811
+    from omegaconf import OmegaConf as _OmegaConf
 
+    from examples.embodiment.collect_base_vla_rollouts import (
+        _env_obs_for_vla as _env_obs_for_vla_sub,
+    )
+    from examples.embodiment.collect_base_vla_rollouts import (
+        _proprio_from_obs as _proprio_from_obs_sub,
+    )
+    from examples.embodiment.collect_base_vla_rollouts import (
+        _to_python as _to_python_sub,
+    )
+    from rlinf.envs.libero.libero_env import LiberoEnv
+
+    # Diversify seeds across workers so episodes don't repeat.
+    _torch.manual_seed(seed + env_id * 1000)
+    _np.random.seed(seed + env_id * 1000)
+
+    env_cfg = _OmegaConf.create(env_cfg_dict)
+    # LiberoEnv shards `reset_state_ids_all` along the first axis by
+    # `total_num_processes`, then each worker indexes row `seed_offset`.
+    # So we tell each worker the global pool size + its own slice id,
+    # giving disjoint init-state sequences across workers.
+    env = LiberoEnv(
+        cfg=env_cfg,
+        num_envs=1,
+        seed_offset=env_id,
+        total_num_processes=int(total_num_workers),
+        worker_info=None,
+    )
+    _log.info("env ready; will run %d episodes", max_episodes)
+
+    eps_done = 0
+    try:
+        while eps_done < max_episodes:
+            obs, _ = env.reset()
+            done = False
+            success = 0
+            steps_taken = 0
+            while not done and steps_taken < max_episode_len:
+                # Package obs for VLA. Move tensors to CPU + detach so they
+                # serialize cleanly across the queue (spawn pickles them).
+                env_obs = _env_obs_for_vla_sub(obs)
+                payload = {}
+                for k, v in env_obs.items():
+                    if v is None:
+                        payload[k] = None
+                    elif _torch.is_tensor(v):
+                        payload[k] = v.detach().cpu()
+                    else:
+                        payload[k] = v
+                proprio = _proprio_from_obs_sub(obs).detach().cpu().numpy()
+
+                req_queue.put((env_id, payload, proprio))
+                action_chunk = resp_queue.get()  # np.ndarray [C, A]
+
+                for c in range(chunk_len):
+                    if done:
+                        break
+                    step_action = action_chunk[c].reshape(1, action_dim)
+                    obs, _r, terms, truncs, info = env.step(step_action)
+                    steps_taken += 1
+                    term_val = bool(_to_python_sub(terms, idx=0))
+                    trunc_val = bool(_to_python_sub(truncs, idx=0))
+                    if term_val:
+                        success = 1
+                        done = True
+                    elif trunc_val:
+                        done = True
+
+            # Episode finished. task_id semantics mirror the sequential
+            # path (`ep % max(1, num_tasks)`), but each worker has its
+            # own ep counter so the main process re-derives per-task
+            # bucketing from a global episode index it sends down.
+            result_queue.put(
+                {
+                    "env_id": env_id,
+                    "worker_ep_idx": eps_done,
+                    "success": int(success),
+                    "steps": int(steps_taken),
+                }
+            )
+            eps_done += 1
+    except Exception as e:  # pragma: no cover - subprocess fatal path
+        _log.exception("worker crashed: %s", e)
+        # Signal a failure so main doesn't hang.
+        try:
+            result_queue.put(
+                {
+                    "env_id": env_id,
+                    "worker_ep_idx": eps_done,
+                    "success": 0,
+                    "steps": 0,
+                    "error": str(e),
+                }
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
+
+
+def _run_async_eval(args, cfg, device: str, max_episode_len: int) -> dict:
+    """Async eval: spawn N env workers, serve inference centrally."""
+    import multiprocessing as mp
+    import queue as _queue
+
+    # mp.spawn so robosuite/MuJoCo doesn't fork an initialized GL state.
+    ctx = mp.get_context("spawn")
+
+    chunk_len = int(cfg.model.chunk_len)
+    action_dim = int(cfg.model.action_dim)
+    num_tasks = int(cfg.env.get("num_tasks", 1))
+    num_envs = int(args.num_envs)
+    num_eval = int(args.num_eval)
+    assert num_envs >= 1
+    assert num_eval >= 1
+
+    # Even-ish split (first num_eval % num_envs workers get +1 episode).
+    eps_per_worker = [
+        (num_eval // num_envs) + (1 if i < (num_eval % num_envs) else 0)
+        for i in range(num_envs)
+    ]
     log.info(
-        "config=%s ckpt=%s num_eval=%d max_ep_len=%d device=%s",
-        args.config,
-        args.ckpt,
-        args.num_eval,
-        max_episode_len,
-        device,
+        "async eval: num_envs=%d num_eval=%d split=%s",
+        num_envs,
+        num_eval,
+        eps_per_worker,
     )
 
+    # Serialize env_cfg to a plain dict for queue transport.
+    env_cfg_omega = _qrt_to_env_cfg(cfg.env, max_episode_len, seed=args.seed)
+    env_cfg_dict = OmegaConf.to_container(env_cfg_omega, resolve=True)
+
+    # Load VLA + optional worker in the MAIN process only.
+    vla = _load_vla(cfg.model, device=device)
+    worker = _maybe_load_worker(cfg, args.ckpt, device=device)
+
+    req_queue = ctx.Queue()
+    result_queue = ctx.Queue()
+    resp_queues = [ctx.Queue() for _ in range(num_envs)]
+
+    procs = []
+    log_level = log.getEffectiveLevel()
+    for i in range(num_envs):
+        if eps_per_worker[i] <= 0:
+            continue
+        p = ctx.Process(
+            target=_env_worker,
+            args=(
+                i,
+                env_cfg_dict,
+                max_episode_len,
+                int(args.seed),
+                chunk_len,
+                action_dim,
+                num_tasks,
+                eps_per_worker[i],
+                num_envs,
+                req_queue,
+                resp_queues[i],
+                result_queue,
+                log_level,
+            ),
+            daemon=False,
+        )
+        p.start()
+        procs.append((i, p))
+    log.info("launched %d env worker subprocesses", len(procs))
+
+    # Serve inference + drain results.
+    n_completed = 0
+    n_success = 0
+    per_task: dict[int, list[int]] = {}
+    # Each worker gets a base ep index = sum of previous workers' eps.
+    base_ep_idx = [sum(eps_per_worker[:i]) for i in range(num_envs)]
+
+    try:
+        while n_completed < num_eval:
+            # Drain finished episodes.
+            try:
+                while True:
+                    r = result_queue.get_nowait()
+                    n_completed += 1
+                    n_success += int(r.get("success", 0))
+                    global_ep_idx = base_ep_idx[r["env_id"]] + r["worker_ep_idx"]
+                    task_id = global_ep_idx % max(1, num_tasks)
+                    per_task.setdefault(task_id, []).append(int(r.get("success", 0)))
+                    log.info(
+                        "ep %d/%d (env=%d worker_ep=%d) success=%d steps=%d "
+                        "cumulative=%d",
+                        n_completed,
+                        num_eval,
+                        r["env_id"],
+                        r["worker_ep_idx"],
+                        int(r.get("success", 0)),
+                        int(r.get("steps", 0)),
+                        n_success,
+                    )
+            except _queue.Empty:
+                pass
+            if n_completed >= num_eval:
+                break
+            # Serve next inference request.
+            try:
+                env_id, env_obs, proprio_np = req_queue.get(timeout=1.0)
+            except _queue.Empty:
+                continue
+            # Move tensors back to device.
+            env_obs_dev = {}
+            for k, v in env_obs.items():
+                if v is None:
+                    env_obs_dev[k] = None
+                elif torch.is_tensor(v):
+                    env_obs_dev[k] = v.to(device, non_blocking=True)
+                else:
+                    env_obs_dev[k] = v
+
+            with torch.no_grad():
+                actions_chunk, _ = vla.predict_action_batch(env_obs_dev, mode="eval")
+                if actions_chunk.dim() == 2:
+                    actions_chunk = actions_chunk.view(1, chunk_len, action_dim)
+                ref_chunk = actions_chunk[0].detach().float()  # [C, A]
+                if worker is not None:
+                    z = vla.extract_embeddings(env_obs_dev).float().to(device)
+                    z_rl = worker.encoder(z)
+                    s_p = (
+                        torch.as_tensor(proprio_np, dtype=torch.float32)
+                        .unsqueeze(0)
+                        .to(device)
+                    )
+                    ref_in = ref_chunk.unsqueeze(0).to(device)
+                    refined = worker.actor(z_rl, s_p, ref_in, training=False)[0].cpu()
+                    action_chunk_cpu = refined
+                else:
+                    action_chunk_cpu = ref_chunk.cpu()
+            # Ship numpy back over the queue (no autograd tape).
+            resp_queues[env_id].put(action_chunk_cpu.numpy())
+    finally:
+        for env_id, p in procs:
+            if p.is_alive():
+                p.terminate()
+        for env_id, p in procs:
+            p.join(timeout=30)
+
+    sr = n_success / max(1, num_eval)
+    return {
+        "sr": sr,
+        "n_success": int(n_success),
+        "n_eval": int(num_eval),
+        "per_task_sr": {
+            int(k): float(sum(v) / len(v)) for k, v in per_task.items() if v
+        },
+        "ckpt": args.ckpt,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Sequential path (backwards-compatible; preserved bit-for-bit)
+# --------------------------------------------------------------------------- #
+def _run_sequential_eval(args, cfg, device: str, max_episode_len: int) -> dict:
     vla = _load_vla(cfg.model, device=device)
     worker = _maybe_load_worker(cfg, args.ckpt, device=device)
     env = _make_env(cfg.env, max_episode_len, seed=args.seed)
@@ -335,7 +631,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     sr = n_success / max(1, int(args.num_eval))
-    result = {
+    return {
         "sr": sr,
         "n_success": int(n_success),
         "n_eval": int(args.num_eval),
@@ -344,10 +640,48 @@ def main(argv: list[str] | None = None) -> int:
         },
         "ckpt": args.ckpt,
     }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    cfg = OmegaConf.load(args.config)
+    apply_overrides(cfg, args.override)
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    max_episode_len = int(
+        args.max_episode_len
+        if args.max_episode_len is not None
+        else cfg.env.get("max_episode_len", 600)
+    )
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    log.info(
+        "config=%s ckpt=%s num_eval=%d num_envs=%d max_ep_len=%d device=%s",
+        args.config,
+        args.ckpt,
+        args.num_eval,
+        args.num_envs,
+        max_episode_len,
+        device,
+    )
+
+    if int(args.num_envs) <= 1:
+        result = _run_sequential_eval(args, cfg, device, max_episode_len)
+    else:
+        result = _run_async_eval(args, cfg, device, max_episode_len)
+
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(result, indent=2))
-    log.info("SR=%.3f n_success=%d/%d → %s", sr, n_success, args.num_eval, out_path)
+    log.info(
+        "SR=%.3f n_success=%d/%d → %s",
+        result["sr"],
+        result["n_success"],
+        result["n_eval"],
+        out_path,
+    )
     return 0
 
 
