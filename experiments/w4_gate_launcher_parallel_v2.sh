@@ -68,7 +68,7 @@ run_lane() {
             python examples/embodiment/eval_libero_sr.py \
                 --config ${CFG} \
                 --ckpt ${LANE_OUT}/ckpt.pt \
-                --num_eval 25 \
+                --num_eval 50 \
                 --seed 1 \
                 --output ${LANE_OUT}/eval_sr.json \
                 > ${LANE_TAG}_eval.log 2>&1
@@ -96,7 +96,7 @@ run_b0() {
         echo "[b0 g${GPU}] $(date +%Y-%m-%d_%H:%M:%S) eval start" >> ${LANE_TAG}.log
         python examples/embodiment/eval_libero_sr.py \
             --config ${CFG} \
-            --num_eval 25 \
+            --num_eval 50 \
             --seed 1 \
             --output ${LANE_OUT}/eval_sr.json \
             > ${LANE_TAG}_eval.log 2>&1
