@@ -21,8 +21,13 @@ new ckpt across a pool of GPU worker threads (default GPU 3 + GPU 7).
 
 Lanes
 -----
-- ``qrt_beta{0p1,0p3,1p0}_seed{1,2}`` under ``--run_dir`` —
-  matches the layout written by ``experiments/beta_sweep_phase1_launcher.sh``.
+- Default ``--lane_glob 'qrt_beta*'`` matches the six β-sweep lanes
+  ``qrt_beta{0p1,0p3,1p0}_seed{1,2}`` under ``--run_dir`` — the layout
+  written by ``experiments/beta_sweep_phase1_launcher.sh``.
+- Pass ``--lane_glob 'iql_*'`` for the σ-QRT IQL sweep (lanes named
+  ``iql_tau*_beta*_seed*`` written by ``iql_sweep_phase1_launcher.sh``).
+- Any other glob works too — lane subdirs are discovered from
+  ``run_dir`` at startup via ``Path.glob(lane_glob)``.
 
 Per-lane outputs
 ----------------
@@ -53,9 +58,18 @@ Design notes
 
 Usage
 -----
+    # β sweep (default lane glob 'qrt_beta*'):
     python experiments/beta_sweep_periodic_eval_coordinator.py \\
         --run_dir runs/beta_sweep_phase1_20260514_043746 \\
         --gpus 3,7 \\
+        --poll_interval 60 \\
+        --max_wait 14400
+
+    # IQL sweep:
+    python experiments/beta_sweep_periodic_eval_coordinator.py \\
+        --run_dir runs/iql_sweep_phase1_<stamp> \\
+        --gpus 7 \\
+        --lane_glob 'iql_*' \\
         --poll_interval 60 \\
         --max_wait 14400
 """
@@ -92,14 +106,19 @@ DEFAULT_CONFIG = (
     / "libero_long_qrt_openpi_pi05.yaml"
 )
 
-LANE_DIRS = [
-    "qrt_beta0p1_seed1",
-    "qrt_beta0p1_seed2",
-    "qrt_beta0p3_seed1",
-    "qrt_beta0p3_seed2",
-    "qrt_beta1p0_seed1",
-    "qrt_beta1p0_seed2",
-]
+DEFAULT_LANE_GLOB = "qrt_beta*"
+
+
+def _discover_lane_dirs(run_dir: Path, lane_glob: str) -> list[str]:
+    """Return sorted lane subdir names under ``run_dir`` matching ``lane_glob``.
+
+    A lane is any subdirectory of ``run_dir`` whose name matches the glob.
+    Files (e.g. ``launcher.log``) and the B0 zero-shot dir (no training, hence
+    no ckpt_step* files) are skipped naturally — for the β-sweep case the
+    ``qrt_beta*`` glob excludes ``b0`` by name; for the IQL sweep the
+    ``iql_*`` glob isolates the seven IQL lanes.
+    """
+    return sorted(p.name for p in run_dir.glob(lane_glob) if p.is_dir())
 
 
 # --------------------------------------------------------------------------- #
@@ -451,6 +470,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Guards against early-start contention with the lingering B0 eval."
         ),
     )
+    p.add_argument(
+        "--lane_glob",
+        default=DEFAULT_LANE_GLOB,
+        help=(
+            "Glob (relative to --run_dir) that selects lane subdirs; e.g. "
+            "'qrt_beta*' for the β sweep (default), 'iql_*' for the IQL "
+            "sweep. Non-matching subdirs (e.g. b0) are ignored."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -474,9 +502,18 @@ def main(argv: list[str] | None = None) -> int:
         log.error("config does not exist: %s", cfg_path)
         return 2
 
+    lane_dirs = _discover_lane_dirs(run_dir, args.lane_glob)
+    if not lane_dirs:
+        log.error(
+            "no lane subdirs under %s matched glob %r — nothing to watch",
+            run_dir,
+            args.lane_glob,
+        )
+        return 2
+
     log.info(
         "run_dir=%s gpus=%s cfg=%s num_eval=%d num_envs=%d seed=%d "
-        "poll=%ds max_wait=%ds gpu_min_free=%dMiB",
+        "poll=%ds max_wait=%ds gpu_min_free=%dMiB lane_glob=%r lanes=%s",
         run_dir,
         gpus,
         cfg_path,
@@ -486,11 +523,13 @@ def main(argv: list[str] | None = None) -> int:
         args.poll_interval,
         args.max_wait,
         args.gpu_min_free_mib,
+        args.lane_glob,
+        lane_dirs,
     )
 
     job_q: "queue.Queue[Job | None]" = queue.Queue()
     stop_evt = threading.Event()
-    lane_locks = {name: threading.Lock() for name in LANE_DIRS}
+    lane_locks = {name: threading.Lock() for name in lane_dirs}
     seen: dict[str, tuple[str, float]] = {}  # f"{lane}/{ckpt.name}" → signature
 
     threads: list[threading.Thread] = []
@@ -520,9 +559,9 @@ def main(argv: list[str] | None = None) -> int:
     rc = 0
     try:
         while True:
-            # Scan all six lanes.
+            # Scan all lanes matched at startup.
             new_count = 0
-            for lane_name in LANE_DIRS:
+            for lane_name in lane_dirs:
                 lane_out = run_dir / lane_name
                 for ckpt in _list_intermediate_ckpts(lane_out):
                     key = f"{lane_name}/{ckpt.name}"
@@ -544,23 +583,24 @@ def main(argv: list[str] | None = None) -> int:
                 last_new_t = time.time()
                 drain_armed_at = None  # any new work resets the drain timer
 
-            # Termination: all six .lane_done present + queue drained.
+            # Termination: all .lane_done present + queue drained.
             all_lanes_done = all(
-                (run_dir / name / ".lane_done").exists() for name in LANE_DIRS
+                (run_dir / name / ".lane_done").exists() for name in lane_dirs
             )
             queue_drained = job_q.unfinished_tasks == 0
             if all_lanes_done and queue_drained:
                 if drain_armed_at is None:
                     drain_armed_at = time.time()
                     log.info(
-                        "all six .lane_done sentinels + queue drained; "
+                        "all %d .lane_done sentinels + queue drained; "
                         "drain buffer %ds armed",
+                        len(lane_dirs),
                         args.drain_buffer_s,
                     )
                 elif time.time() - drain_armed_at >= args.drain_buffer_s:
                     # Final rescan after the buffer.
                     final_new = 0
-                    for lane_name in LANE_DIRS:
+                    for lane_name in lane_dirs:
                         lane_out = run_dir / lane_name
                         for ckpt in _list_intermediate_ckpts(lane_out):
                             key = f"{lane_name}/{ckpt.name}"
