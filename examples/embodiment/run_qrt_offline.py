@@ -177,6 +177,69 @@ def _move_to_device_async(batch: dict, device) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Pre-warmed encoder cache loader (σ-QRT G2 follow-up)
+# --------------------------------------------------------------------------- #
+_ENCODER_CFG_KEYS = (
+    "token_dim",
+    "encoder_layers",
+    "encoder_heads",
+    "encoder_ffn",
+    "decoder_layers",
+    "decoder_heads",
+    "decoder_ffn",
+    "decoder_max_len",
+)
+
+
+def _load_encoder_cache(worker, cfg, encoder_ckpt_path: str) -> None:
+    """Load a stripped encoder+decoder ckpt into the worker.
+
+    Validates that the cached cfg.model dims match the live cfg.model
+    dims for every key in ``_ENCODER_CFG_KEYS`` that is present in the
+    cache. Any mismatch raises ``RuntimeError`` so callers don't silently
+    train against a misconfigured encoder.
+
+    Side effect: applies state_dicts to ``worker.encoder`` and
+    ``worker.decoder`` via ``load_state_dict(strict=True)``. Caller is
+    responsible for skipping Stage 1 after this returns.
+    """
+    cache_path = Path(encoder_ckpt_path)
+    if not cache_path.is_file():
+        raise FileNotFoundError(f"--encoder_ckpt not found: {cache_path}")
+    cache = torch.load(cache_path, map_location="cpu", weights_only=False)
+    if not isinstance(cache, dict) or "encoder" not in cache or "decoder" not in cache:
+        raise RuntimeError(
+            f"--encoder_ckpt {cache_path} is not a stripped encoder cache; "
+            f"expected keys 'encoder' + 'decoder', got "
+            f"{sorted(cache.keys()) if isinstance(cache, dict) else type(cache).__name__}"
+        )
+
+    cached_model_cfg = (cache.get("cfg_partial") or {}).get("model") or {}
+    live_model = cfg.get("model", {}) or {}
+    mismatches = []
+    for k in _ENCODER_CFG_KEYS:
+        if k not in cached_model_cfg:
+            continue
+        cached_v = cached_model_cfg[k]
+        live_v = live_model.get(k)
+        if cached_v != live_v:
+            mismatches.append(f"  {k}: cache={cached_v!r} live={live_v!r}")
+    if mismatches:
+        raise RuntimeError(
+            "[run_qrt] encoder cache cfg.model mismatch — refusing to load:\n"
+            + "\n".join(mismatches)
+        )
+
+    worker.encoder.load_state_dict(cache["encoder"], strict=True)
+    worker.decoder.load_state_dict(cache["decoder"], strict=True)
+    log.info(
+        "[run_qrt] loaded encoder from %s, skipping stage 1 (cache cfg=%s)",
+        cache_path,
+        cached_model_cfg,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Variant builders
 # --------------------------------------------------------------------------- #
 def _build_worker(cfg, variant: str, device: str):
@@ -562,6 +625,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(only the final ``ckpt.pt`` is written). Default 2000."
         ),
     )
+    p.add_argument(
+        "--encoder_ckpt",
+        type=str,
+        default=None,
+        help=(
+            "Path to a pre-warmed encoder/decoder ckpt produced by "
+            "``experiments/extract_encoder_ckpt.py``. When set, encoder + "
+            "decoder state_dicts are loaded into the worker after setup() "
+            "and Stage-1 warmup is SKIPPED (saves ~100 min/lane on B200). "
+            "Encoder/decoder dims in the cache must match cfg.model — a "
+            "mismatch errors out. Ignored (with warning) for the "
+            "``a1_raw_features`` variant since that variant bypasses the "
+            "encoder entirely."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -613,11 +691,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     log.info("buffer loaded: %d trajectories", len(buf))
 
+    # Pre-warmed encoder cache → load encoder + decoder, then skip Stage 1.
+    # For a1_raw_features the encoder is bypassed entirely so the cache is
+    # meaningless; warn + ignore. For all other variants the cache replaces
+    # the Stage-1 warmup (≈100 min/lane saved on B200).
+    skip_stage1_via_cache = False
+    if args.encoder_ckpt is not None:
+        if args.variant == "a1_raw_features":
+            log.warning(
+                "[run_qrt] --encoder_ckpt=%s ignored: variant=a1_raw_features "
+                "bypasses the encoder",
+                args.encoder_ckpt,
+            )
+        else:
+            _load_encoder_cache(worker, cfg, args.encoder_ckpt)
+            skip_stage1_via_cache = True
+
     # Stage 1 (warmup). Skipped for a1_raw_features (encoder bypassed; no
-    # representation to train against recon loss).
+    # representation to train against recon loss) and skipped when a
+    # pre-warmed --encoder_ckpt is loaded.
     metrics_log: list[dict] = []
     if args.variant == "a1_raw_features":
         log.info("variant=a1_raw_features → Stage 1 token warmup SKIPPED")
+    elif skip_stage1_via_cache:
+        log.info(
+            "--encoder_ckpt=%s loaded → Stage 1 token warmup SKIPPED",
+            args.encoder_ckpt,
+        )
     else:
         metrics_log.extend(
             _run_stage1(worker, buf, cfg, args.variant, device, use_bf16=args.bf16)
