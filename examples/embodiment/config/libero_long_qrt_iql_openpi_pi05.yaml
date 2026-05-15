@@ -83,6 +83,17 @@ training:
   residual_alpha: 0.1         # Q-max term weight (α). Larger → more aggressive correction.
   residual_reg: 0.0           # Optional L2 on Δ. 0 disables.
 
+  # ----- G2 v3 CQL conservative penalty (off by default; opt in per-launcher) -----
+  # When use_cql=true, the IQL Q-loss adds α_cql · (logsumexp_a Q(s,a) − Q(s,a_data)).
+  # Pushes Q(s, OOD_a) DOWN relative to Q(s, a_data), giving the residual
+  # actor a prefer-in-distribution gradient. See losses.qrt_cql_penalty.
+  use_cql: false
+  cql_alpha: 1.0              # Penalty weight. Sweep {0.5, 1.0, 5.0}.
+  cql_num_random: 10          # Random actions sampled per state.
+  cql_action_low: -1.0
+  cql_action_high: 1.0
+  cql_noise_std: 0.3          # Local perturbation stddev for CQL(H)-style sampling.
+
 env:
   name: libero_long
   num_tasks: 10

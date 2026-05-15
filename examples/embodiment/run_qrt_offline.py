@@ -604,6 +604,18 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--use_cql",
+        action="store_true",
+        help=(
+            "Activate G2 v3 CQL conservative penalty on top of IQL. Adds "
+            "α_cql · (logsumexp_a Q(s,a) − Q(s, a_data)) to the Q-loss, "
+            "pushing Q(s, OOD_a) DOWN relative to in-distribution actions. "
+            "Sets cfg.training.use_cql=true. Requires --use_iql (or "
+            "use_iql=true in yaml) — CQL is implemented as an additive term "
+            "on the IQL Q-update, not a standalone algorithm."
+        ),
+    )
+    p.add_argument(
         "--bf16",
         action="store_true",
         help=(
@@ -653,6 +665,18 @@ def main(argv: list[str] | None = None) -> int:
         if "training" not in cfg:
             cfg.training = {}
         cfg.training.use_iql = True
+
+    # CLI --use_cql wins over yaml; preserves yaml's use_cql=true if set.
+    # Requires use_iql (CQL is implemented as additive term on IQL Q-loss).
+    if args.use_cql:
+        if "training" not in cfg:
+            cfg.training = {}
+        cfg.training.use_cql = True
+        if not cfg.training.get("use_iql", False):
+            raise ValueError(
+                "--use_cql requires --use_iql (or training.use_iql=true in yaml). "
+                "CQL is an additive penalty on the IQL Q-loss, not standalone."
+            )
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

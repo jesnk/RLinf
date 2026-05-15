@@ -45,6 +45,7 @@ import torch.nn as nn
 from rlinf.algorithms.losses import (
     qrt_actor_loss,
     qrt_compute_target,
+    qrt_cql_penalty,
     qrt_critic_loss,
     qrt_iql_actor_loss,
     qrt_iql_q_loss,
@@ -237,6 +238,18 @@ class QRTOfflinePolicyWorker:
         self.iql_beta = float(tr.get("iql_beta", 3.0))
         self.iql_weight_clip = float(tr.get("iql_weight_clip", 100.0))
 
+        # G2 v3 CQL conservative penalty (only used when use_iql=True).
+        # When use_cql=true, the IQL Q-loss adds an α_cql · CQL penalty term
+        # that pushes Q(s, OOD_a) DOWN relative to Q(s, a_data). This gives
+        # the residual actor a real "in-distribution preference" gradient
+        # signal, fixing the q_std flat ceiling observed in G2 v2.
+        self.use_cql = bool(tr.get("use_cql", False))
+        self.cql_alpha = float(tr.get("cql_alpha", 1.0))
+        self.cql_num_random = int(tr.get("cql_num_random", 10))
+        self.cql_action_low = float(tr.get("cql_action_low", -1.0))
+        self.cql_action_high = float(tr.get("cql_action_high", 1.0))
+        self.cql_noise_std = float(tr.get("cql_noise_std", 0.3))
+
         # G2 residual-actor variant (only used when use_iql=True). Actor
         # learns a small correction Δ on top of π0.5's reference action;
         # SR floor = B0 (ref alone) is structurally guaranteed by the
@@ -377,6 +390,12 @@ class QRTOfflinePolicyWorker:
              Encoder + decoder + V all backprop. Recon aux stays on encoder/decoder
              via this backward pass.
           2. Q update — TD target uses V(s') (no OOD Q query). Encoder + critic.
+             G2 v3: when ``use_cql=True``, an α_cql · CQL conservative penalty
+             is added to the Q loss, pushing Q(s, OOD_a) DOWN relative to
+             Q(s, a_data) and giving the residual actor a prefer-in-distribution
+             gradient signal. CQL queries Q at random / noisy-data actions — this
+             *is* an OOD Q query, but with explicit penalty pressure (the entire
+             point), not silent bootstrap drift.
           3. Actor update — advantage-weighted regression on deterministic μ_θ.
              Encoder + actor.
           4. Soft target-critic update. No target V (per IQL paper §4.2).
@@ -444,9 +463,32 @@ class QRTOfflinePolicyWorker:
             v_next = self.v_net(z_rl_next, next_s_p)
         q12 = self._q(z_rl_q, s_p, action, target=False)
         q1, q2 = q12.unbind(dim=-1)
-        loss_q = qrt_iql_q_loss(
+        loss_q_td = qrt_iql_q_loss(
             q1, q2, reward, v_next, done, self.gamma, self.chunk_len
         )
+
+        # G2 v3: CQL conservative penalty on critic.
+        # Penalty pushes Q(s, OOD_a) DOWN relative to Q(s, a_data), giving
+        # the residual actor a "prefer in-distribution Δ" gradient signal.
+        # q12 is already Q at the dataset action — re-use to avoid an extra
+        # forward. state_feat reconstructed here to match critic API.
+        if self.use_cql and self.cql_alpha > 0:
+            state_feat_cql = torch.cat([z_rl_q, s_p], dim=-1)
+            action_feat_cql = action.flatten(start_dim=1)
+            loss_cql = qrt_cql_penalty(
+                critic=self.critic,
+                state_feat=state_feat_cql,
+                action_data=action_feat_cql,
+                q_data=q12,  # [B, num_q]
+                num_random=self.cql_num_random,
+                action_low=self.cql_action_low,
+                action_high=self.cql_action_high,
+                noise_std=self.cql_noise_std,
+            )
+            loss_q = loss_q_td + self.cql_alpha * loss_cql
+        else:
+            loss_cql = torch.zeros((), device=q1.device, dtype=q1.dtype)
+            loss_q = loss_q_td
 
         self.opt_critic.zero_grad(set_to_none=True)
         self.opt_enc.zero_grad(set_to_none=True)
@@ -559,6 +601,9 @@ class QRTOfflinePolicyWorker:
             "advantage_mean": float(advantage.mean().item()),
             "weight_mean": float(weight.mean().item()),
         }
+        if self.use_cql:
+            out_metrics["loss_q_td"] = float(loss_q_td.detach().item())
+            out_metrics["loss_cql"] = float(loss_cql.detach().item())
         if self.use_residual_actor:
             with torch.no_grad():
                 # delta is in scope from the residual branch above.

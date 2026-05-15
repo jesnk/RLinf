@@ -653,3 +653,120 @@ def qrt_iql_actor_loss(
     weight = torch.exp(beta_iql * advantage).clamp(max=weight_clip)  # [B]
     bc_err = ((actions - mu_actor) ** 2).sum(dim=(-1, -2))  # [B]
     return (weight * bc_err).mean()
+
+
+# ----------------------------------------------------------------------
+# σ-QRT CQL conservative penalty (G2 v3)
+# Reference: Kumar et al. 2020 (Conservative Q-Learning).
+#
+# Motivation
+# ----------
+# G2 v2 critic capacity sweep showed med (1024/4) sweet spot but SR still
+# capped at 0.18 << B0=0.48. Hypothesis: critic q_std is flat (~0.005)
+# because IQL only ever queries Q at dataset actions — there is no
+# pressure for Q to be LOWER on OOD actions than buffer-supported ones.
+# Without that pressure, Q is informative only at the data manifold,
+# and the residual actor's Q-max term cannot find a gradient that
+# *prefers* in-distribution Δ over out-of-distribution Δ.
+#
+# CQL adds an explicit penalty:
+#       L_CQL = α_cql · E_s[ logsumexp_{a ~ ρ(a|s)} Q(s, a)  −  Q(s, a_data) ]
+# The expectation pushes Q(s, OOD_a) DOWN relative to Q(s, in_dist_a),
+# producing a Q surface where in-distribution actions are explicitly
+# higher than OOD perturbations. The actor's Q-max term then has a
+# gradient that points toward the data manifold.
+#
+# Combination with IQL
+# --------------------
+# IQL provides safe TD bootstrap (V(s') instead of max_a Q(s', a')).
+# CQL adds the OOD pressure that IQL alone lacks. Combined ("IQL+CQL"):
+#   total_q_loss = qrt_iql_q_loss(...) + α_cql · cql_penalty(...)
+# This is the canonical hybrid used in narrow-buffer offline RL.
+#
+# Action sampling distribution ρ(a|s)
+# -----------------------------------
+# Standard CQL uses a uniform distribution over the action range. For
+# our chunked, large-action-feature setup ([B, C·d_act] = e.g. [128, 56]
+# for chunk_len=8, d_act=7), uniform-over-[-1,1] is reasonable since
+# our action normalization (from openpi) maps to ~[-1, 1]. We also
+# include a noisy-data-action sample (a_data + ε) to capture local
+# perturbations, which is sometimes called "CQL(H)" in the literature.
+# ----------------------------------------------------------------------
+
+
+def qrt_cql_penalty(
+    critic: torch.nn.Module,
+    state_feat: torch.Tensor,
+    action_data: torch.Tensor,
+    q_data: torch.Tensor,
+    num_random: int = 10,
+    action_low: float = -1.0,
+    action_high: float = 1.0,
+    noise_std: float = 0.3,
+) -> torch.Tensor:
+    """CQL conservative penalty (logsumexp - in-dist Q).
+
+    Args:
+        critic: MultiQHead. Called as ``critic(state_feat_expanded,
+            action_feat_expanded)`` returning ``[B*N, num_q]``.
+        state_feat: [B, state_dim] concatenated z_rl + s_p.
+        action_data: [B, action_feat_dim] flattened in-distribution
+            action (per-row matches state_feat row).
+        q_data: [B, num_q] critic output at (state_feat, action_data).
+            Used as the "in-distribution Q" term — no gradient stop:
+            penalty PULLS this term UP (positive sign in loss) while
+            PUSHING the random-action logsumexp DOWN.
+        num_random: N — number of random actions to sample per state.
+            Standard CQL uses 10. Each call adds N forward passes.
+        action_low, action_high: uniform sampling range. Defaults match
+            openpi action normalization.
+        noise_std: stddev of Gaussian noise added to a_data for the
+            "local perturbation" half of the samples. Set to 0 to use
+            pure uniform sampling.
+
+    Returns:
+        scalar penalty value (multiply by α_cql in the caller).
+    """
+    B, state_dim = state_feat.shape
+    action_feat_dim = action_data.shape[-1]
+    N = num_random
+
+    # Split N samples: half uniform, half noisy a_data (CQL(H) style).
+    n_unif = max(1, N // 2)
+    n_noisy = N - n_unif
+    rand_unif = torch.empty(
+        B, n_unif, action_feat_dim, device=state_feat.device, dtype=state_feat.dtype
+    ).uniform_(action_low, action_high)
+    if n_noisy > 0 and noise_std > 0:
+        noise = (
+            torch.randn(
+                B,
+                n_noisy,
+                action_feat_dim,
+                device=state_feat.device,
+                dtype=state_feat.dtype,
+            )
+            * noise_std
+        )
+        rand_noisy = (action_data.unsqueeze(1) + noise).clamp(action_low, action_high)
+        rand_actions = torch.cat([rand_unif, rand_noisy], dim=1)  # [B, N, A]
+    else:
+        rand_actions = rand_unif
+
+    # Expand state and forward critic vectorized: [B*N, state_dim], [B*N, A].
+    state_rep = (
+        state_feat.unsqueeze(1).expand(B, N, state_dim).reshape(B * N, state_dim)
+    )
+    action_rep = rand_actions.reshape(B * N, action_feat_dim)
+    q_rand = critic(state_rep, action_rep)  # [B*N, num_q]
+    q_rand = q_rand.view(B, N, -1)  # [B, N, num_q]
+
+    # Importance correction for uniform samples: log ρ(a) is constant for
+    # uniform, so log(1/V) where V = (action_high-action_low)**action_feat_dim.
+    # In log-space this is action_feat_dim*log(action_high-action_low), which
+    # is a global constant and cancels in the gradient. Skip for simplicity
+    # (matches "CQL-lite" variants and avoids huge dim*log shifts that blow
+    # up logsumexp numerics for large action_feat_dim).
+    logsumexp_q = torch.logsumexp(q_rand, dim=1)  # [B, num_q]
+    # Average over twin heads — penalty applied to BOTH critics symmetrically.
+    return (logsumexp_q.mean(dim=-1) - q_data.mean(dim=-1)).mean()
