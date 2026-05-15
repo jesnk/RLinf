@@ -225,8 +225,16 @@ def _eval_one_episode(
     cfg_model,
     max_episode_len: int,
     device: str,
-) -> tuple[int, int]:
-    """Roll out a single episode; return (success_flag, steps_taken)."""
+    zero_delta: bool = False,
+) -> tuple[int, int, list[float]]:
+    """Roll out a single episode; return (success_flag, steps_taken, delta_norms).
+
+    ``delta_norms`` is a per-VLA-step list of ||Δ||₂ values (mean across the
+    chunk×action dims, batch=1) populated ONLY when ``worker`` is in residual-
+    actor mode. Empty list otherwise (B0 or non-residual ckpts). When
+    ``zero_delta=True`` Δ is zeroed AFTER measurement, so the executed chunk
+    equals ref but the logged norm reflects the *would-be* correction.
+    """
     chunk_len = int(cfg_model.chunk_len)
     action_dim = int(cfg_model.action_dim)
 
@@ -234,6 +242,8 @@ def _eval_one_episode(
     success = 0
     steps_taken = 0
     done = False
+    delta_norms: list[float] = []
+    is_residual = worker is not None and getattr(worker, "use_residual_actor", False)
 
     while not done and steps_taken < max_episode_len:
         env_obs = _env_obs_for_vla(obs)
@@ -249,10 +259,16 @@ def _eval_one_episode(
                 z_rl = worker.encoder(z)
                 s_p = _proprio_from_obs(obs).unsqueeze(0).to(device)
                 ref_in = ref_chunk.unsqueeze(0).to(device)  # [1, C, A]
-                if getattr(worker, "use_residual_actor", False):
+                if is_residual:
                     delta = worker.actor(
                         z_rl, s_p, ref_in, training=False, residual=True
                     )
+                    # Per VLA-step Δ-norm: L2 over action_dim → [B, C] then mean
+                    # across batch and chunk. Matches the diag spec.
+                    delta_norm_step = delta.pow(2).sum(dim=-1).sqrt().mean().item()
+                    delta_norms.append(float(delta_norm_step))
+                    if zero_delta:
+                        delta = torch.zeros_like(delta)
                     refined = (ref_in + delta)[0].cpu()
                 else:
                     refined = worker.actor(z_rl, s_p, ref_in, training=False)[0].cpu()
@@ -273,7 +289,7 @@ def _eval_one_episode(
                 done = True
             elif trunc_val:
                 done = True
-    return success, steps_taken
+    return success, steps_taken, delta_norms
 
 
 # --------------------------------------------------------------------------- #
@@ -308,6 +324,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Number of parallel env worker subprocesses. 1 = sequential "
             "(backwards compat path). N>1 = async pattern: N env workers "
             "feed a central VLA/worker inference server via mp.Queue."
+        ),
+    )
+    p.add_argument(
+        "--zero_delta",
+        action="store_true",
+        help=(
+            "Diagnostic (residual-actor mode only): force Δ=0 after computing "
+            "it so the refined action equals the π0.5 reference. SR should "
+            "equal B0 if the residual eval path is correct AND Δ≈0 hypothesis "
+            "holds. Lower SR → worker setup drift (encoder/normalization). "
+            "Has no effect on B0 (no worker) or non-residual ckpts."
         ),
     )
     return p.parse_args(argv)
@@ -539,6 +566,17 @@ def _run_async_eval(args, cfg, device: str, max_episode_len: int) -> dict:
     # Each worker gets a base ep index = sum of previous workers' eps.
     base_ep_idx = [sum(eps_per_worker[:i]) for i in range(num_envs)]
 
+    is_residual = worker is not None and getattr(worker, "use_residual_actor", False)
+    zero_delta = bool(getattr(args, "zero_delta", False))
+    if zero_delta and not is_residual:
+        log.warning(
+            "--zero_delta passed but worker is not in residual mode; flag has "
+            "no effect."
+        )
+    # Per-env accumulator for the in-progress episode. Flushed on each result.
+    pending_deltas: dict[int, list[float]] = {i: [] for i in range(num_envs)}
+    ep_delta_stats: list[dict] = []
+
     try:
         while n_completed < num_eval:
             # Drain finished episodes.
@@ -550,6 +588,19 @@ def _run_async_eval(args, cfg, device: str, max_episode_len: int) -> dict:
                     global_ep_idx = base_ep_idx[r["env_id"]] + r["worker_ep_idx"]
                     task_id = global_ep_idx % max(1, num_tasks)
                     per_task.setdefault(task_id, []).append(int(r.get("success", 0)))
+                    # Flush this env's pending Δ-norms as the just-finished
+                    # episode's stats (residual mode only).
+                    ev = int(r["env_id"])
+                    if is_residual and pending_deltas[ev]:
+                        dn = pending_deltas[ev]
+                        ep_delta_stats.append(
+                            {
+                                "mean": float(np.mean(dn)),
+                                "max": float(np.max(dn)),
+                                "final": float(dn[-1]),
+                            }
+                        )
+                    pending_deltas[ev] = []
                     log.info(
                         "ep %d/%d (env=%d worker_ep=%d) success=%d steps=%d "
                         "cumulative=%d",
@@ -594,10 +645,14 @@ def _run_async_eval(args, cfg, device: str, max_episode_len: int) -> dict:
                         .to(device)
                     )
                     ref_in = ref_chunk.unsqueeze(0).to(device)
-                    if getattr(worker, "use_residual_actor", False):
+                    if is_residual:
                         delta = worker.actor(
                             z_rl, s_p, ref_in, training=False, residual=True
                         )
+                        delta_norm_step = delta.pow(2).sum(dim=-1).sqrt().mean().item()
+                        pending_deltas[int(env_id)].append(float(delta_norm_step))
+                        if zero_delta:
+                            delta = torch.zeros_like(delta)
                         refined = (ref_in + delta)[0].cpu()
                     else:
                         refined = worker.actor(z_rl, s_p, ref_in, training=False)[
@@ -616,7 +671,7 @@ def _run_async_eval(args, cfg, device: str, max_episode_len: int) -> dict:
             p.join(timeout=30)
 
     sr = n_success / max(1, num_eval)
-    return {
+    result = {
         "sr": sr,
         "n_success": int(n_success),
         "n_eval": int(num_eval),
@@ -625,6 +680,22 @@ def _run_async_eval(args, cfg, device: str, max_episode_len: int) -> dict:
         },
         "ckpt": args.ckpt,
     }
+    if is_residual:
+        if ep_delta_stats:
+            result["delta_norm_mean"] = float(
+                np.mean([d["mean"] for d in ep_delta_stats])
+            )
+            result["delta_norm_max"] = float(np.max([d["max"] for d in ep_delta_stats]))
+            result["delta_norm_final"] = float(
+                np.mean([d["final"] for d in ep_delta_stats])
+            )
+        else:
+            result["delta_norm_mean"] = float("nan")
+            result["delta_norm_max"] = float("nan")
+            result["delta_norm_final"] = float("nan")
+        if zero_delta:
+            result["zero_delta"] = True
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -637,31 +708,68 @@ def _run_sequential_eval(args, cfg, device: str, max_episode_len: int) -> dict:
 
     n_success = 0
     per_task: dict[int, list[int]] = {}
+    # Per-episode Δ-norm aggregates (residual mode only). Each entry:
+    # {"mean": float, "max": float, "final": float}. Empty for non-residual.
+    ep_delta_stats: list[dict] = []
+    is_residual = worker is not None and getattr(worker, "use_residual_actor", False)
+    if args.zero_delta and not is_residual:
+        log.warning(
+            "--zero_delta passed but worker is not in residual mode "
+            "(worker=%s); flag has no effect.",
+            "None" if worker is None else "non-residual",
+        )
+
     for ep in range(int(args.num_eval)):
         try:
-            success, steps_taken = _eval_one_episode(
-                vla, worker, env, cfg.model, max_episode_len, device
+            success, steps_taken, delta_norms = _eval_one_episode(
+                vla,
+                worker,
+                env,
+                cfg.model,
+                max_episode_len,
+                device,
+                zero_delta=bool(args.zero_delta),
             )
         except Exception:
             log.exception("episode %d failed; marking failure", ep + 1)
-            success, steps_taken = 0, 0
+            success, steps_taken, delta_norms = 0, 0, []
         n_success += success
         # Best-effort task_id from env (LIBERO doesn't surface it in obs;
         # cycle through num_tasks deterministically).
         num_tasks = int(cfg.env.get("num_tasks", 1))
         task_id = ep % max(1, num_tasks)
         per_task.setdefault(task_id, []).append(success)
-        log.info(
-            "ep %d/%d success=%d steps=%d cumulative=%d",
-            ep + 1,
-            args.num_eval,
-            success,
-            steps_taken,
-            n_success,
-        )
+        if is_residual and delta_norms:
+            ep_delta_stats.append(
+                {
+                    "mean": float(np.mean(delta_norms)),
+                    "max": float(np.max(delta_norms)),
+                    "final": float(delta_norms[-1]),
+                }
+            )
+            log.info(
+                "ep %d/%d success=%d steps=%d cumulative=%d Δ(mean/max/final)=%.4f/%.4f/%.4f",
+                ep + 1,
+                args.num_eval,
+                success,
+                steps_taken,
+                n_success,
+                ep_delta_stats[-1]["mean"],
+                ep_delta_stats[-1]["max"],
+                ep_delta_stats[-1]["final"],
+            )
+        else:
+            log.info(
+                "ep %d/%d success=%d steps=%d cumulative=%d",
+                ep + 1,
+                args.num_eval,
+                success,
+                steps_taken,
+                n_success,
+            )
 
     sr = n_success / max(1, int(args.num_eval))
-    return {
+    result = {
         "sr": sr,
         "n_success": int(n_success),
         "n_eval": int(args.num_eval),
@@ -670,6 +778,24 @@ def _run_sequential_eval(args, cfg, device: str, max_episode_len: int) -> dict:
         },
         "ckpt": args.ckpt,
     }
+    # Residual-only diagnostics. Skipped entirely for B0 / non-residual ckpts
+    # so existing JSON consumers (coord, summary scripts) see no new keys.
+    if is_residual:
+        if ep_delta_stats:
+            result["delta_norm_mean"] = float(
+                np.mean([d["mean"] for d in ep_delta_stats])
+            )
+            result["delta_norm_max"] = float(np.max([d["max"] for d in ep_delta_stats]))
+            result["delta_norm_final"] = float(
+                np.mean([d["final"] for d in ep_delta_stats])
+            )
+        else:
+            result["delta_norm_mean"] = float("nan")
+            result["delta_norm_max"] = float("nan")
+            result["delta_norm_final"] = float("nan")
+        if args.zero_delta:
+            result["zero_delta"] = True
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
