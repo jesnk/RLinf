@@ -68,6 +68,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+
 # LIBERO/robosuite headless rendering needs a GL backend (cf.
 # examples/embodiment/eval_embodiment.sh + run_embodiment.sh). brain1 ships
 # EGL/Mesa but NOT OSMesa, and the NVIDIA EGL vendor lives under a non-system
@@ -94,9 +95,8 @@ def _bootstrap_gl_env() -> None:
             continue
         icd_dir = f"{root}/usr/share/glvnd/egl_vendor.d"
         lib_dir = f"{root}/usr/lib/x86_64-linux-gnu"
-        if (
-            os.path.isfile(f"{icd_dir}/10_nvidia.json")
-            and os.path.isfile(f"{lib_dir}/libEGL_nvidia.so.0")
+        if os.path.isfile(f"{icd_dir}/10_nvidia.json") and os.path.isfile(
+            f"{lib_dir}/libEGL_nvidia.so.0"
         ):
             os.environ.setdefault("__EGL_VENDOR_LIBRARY_DIRS", icd_dir)
             existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
@@ -109,9 +109,12 @@ def _bootstrap_gl_env() -> None:
 
 _bootstrap_gl_env()
 
-import numpy as np
-import torch
-from omegaconf import DictConfig, OmegaConf
+import numpy as np  # noqa: E402  (must follow _bootstrap_gl_env)
+import torch  # noqa: E402  (must follow _bootstrap_gl_env)
+from omegaconf import (  # noqa: E402  (must follow _bootstrap_gl_env)
+    DictConfig,
+    OmegaConf,
+)
 
 # --------------------------------------------------------------------------- #
 # Logging setup
@@ -319,6 +322,10 @@ def _rollout_one_episode(
     cfg_collect: DictConfig,
     max_episode_len: int,
     z_obs_dtype: str,
+    action_noise_std: float | None = None,
+    random_action_frac: float = 0.0,
+    random_action_low: float = -1.0,
+    random_action_high: float = 1.0,
 ):
     """Roll out one episode end-to-end, returning lists of per-chunk fields.
 
@@ -368,9 +375,7 @@ def _rollout_one_episode(
         with torch.no_grad():
             z_t = vla.extract_embeddings(env_obs_t)  # [1, M, d]
             # 2. Predict reference action chunk via π0.5's canonical inference path.
-            actions_chunk, result = vla.predict_action_batch(
-                env_obs_t, mode="eval"
-            )
+            actions_chunk, result = vla.predict_action_batch(env_obs_t, mode="eval")
         # actions_chunk: [1, C, A] (already unnormalized via output_transform).
         if actions_chunk.dim() == 2:
             # Flat layout [1, C*A] — reshape.
@@ -378,11 +383,24 @@ def _rollout_one_episode(
 
         ref_chunk = actions_chunk[0].detach().float().cpu()  # [C, A]
 
-        # Take the chunk in env (no exploration noise in v1; cfg_collect.action_noise_std).
-        taken_chunk = ref_chunk.clone()
-        noise_std = float(cfg_collect.get("action_noise_std", 0.0))
-        if noise_std > 0.0:
-            taken_chunk = taken_chunk + torch.randn_like(taken_chunk) * noise_std
+        # Build the chunk to actually execute. ref_chunk is preserved as-is in
+        # the buffer (curr_obs.ref_action / next_obs.ref_action) so residual
+        # actor parametrization keeps a clean π0.5 reference.
+        if random_action_frac > 0.0 and float(np.random.rand()) < random_action_frac:
+            # Full random rollout for this chunk: uniform in [low, high]^A.
+            taken_chunk = (
+                torch.rand_like(ref_chunk) * (random_action_high - random_action_low)
+                + random_action_low
+            )
+        else:
+            taken_chunk = ref_chunk.clone()
+            noise_std = (
+                float(action_noise_std)
+                if action_noise_std is not None
+                else float(cfg_collect.get("action_noise_std", 0.0))
+            )
+            if noise_std > 0.0:
+                taken_chunk = taken_chunk + torch.randn_like(taken_chunk) * noise_std
 
         # Per-step rewards within the chunk.
         chunk_rewards: list[float] = []
@@ -415,9 +433,7 @@ def _rollout_one_episode(
         env_obs_next = _env_obs_for_vla(next_obs)
         with torch.no_grad():
             z_next = vla.extract_embeddings(env_obs_next)  # [1, M, d]
-            actions_next_chunk, _ = vla.predict_action_batch(
-                env_obs_next, mode="eval"
-            )
+            actions_next_chunk, _ = vla.predict_action_batch(env_obs_next, mode="eval")
         if actions_next_chunk.dim() == 2:
             actions_next_chunk = actions_next_chunk.view(1, chunk_len, action_dim)
         ref_next_chunk = actions_next_chunk[0].detach().float().cpu()
@@ -496,12 +512,10 @@ def _pack_trajectory(episode: dict):
     prev_logprobs = _stack(episode["prev_logprobs"])
 
     dones = torch.tensor(episode["dones"], dtype=torch.float32).unsqueeze(1)
-    terminations = torch.tensor(
-        episode["terminations"], dtype=torch.float32
-    ).unsqueeze(1)
-    truncations = torch.tensor(
-        episode["truncations"], dtype=torch.float32
-    ).unsqueeze(1)
+    terminations = torch.tensor(episode["terminations"], dtype=torch.float32).unsqueeze(
+        1
+    )
+    truncations = torch.tensor(episode["truncations"], dtype=torch.float32).unsqueeze(1)
 
     return Trajectory(
         max_episode_length=T,
@@ -553,6 +567,43 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override cfg.env.max_episode_len (smoke tests cap this).",
     )
+    # σ-QRT G2 buffer diversification overrides (added in feat/sigma-qrt-offline,
+    # 2026-05-15). The underlying π0.5 SDE temperature is hard to reach without
+    # patching openpi.sample_actions; instead we expose two post-hoc knobs that
+    # widen the action distribution the critic sees:
+    #   - --action_noise_std: σ of additive Gaussian on the executed chunk
+    #     (overrides cfg.collect.action_noise_std). Acts as an effective
+    #     "policy temperature" knob in action space.
+    #   - --random_action_frac: fraction of chunks whose action is replaced
+    #     by uniform noise in [-1, 1]^A (per-step). Used for full random
+    #     coverage rollouts.
+    # ref_action stored in the buffer is ALWAYS the π0.5 reference (un-noised),
+    # so residual actor parametrization a = ref + Δ stays well-defined.
+    p.add_argument(
+        "--action_noise_std",
+        type=float,
+        default=None,
+        help="Override cfg.collect.action_noise_std (Gaussian σ on executed chunk).",
+    )
+    p.add_argument(
+        "--random_action_frac",
+        type=float,
+        default=0.0,
+        help="Per-chunk probability of replacing executed action with uniform "
+        "noise in [-1, 1]^A. Default 0.0 (no random chunks).",
+    )
+    p.add_argument(
+        "--random_action_low",
+        type=float,
+        default=-1.0,
+        help="Lower bound of uniform random action. Default -1.0.",
+    )
+    p.add_argument(
+        "--random_action_high",
+        type=float,
+        default=1.0,
+        help="Upper bound of uniform random action. Default 1.0.",
+    )
     return p.parse_args(argv)
 
 
@@ -573,13 +624,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(
-        "config=%s env=%s num_episodes=%d max_ep_len=%d seed=%d device=%s",
+        "config=%s env=%s num_episodes=%d max_ep_len=%d seed=%d device=%s "
+        "action_noise_std=%s random_action_frac=%.3f",
         args.config,
         cfg.env.name,
         num_episodes,
         max_episode_len,
         args.seed,
         device,
+        (
+            "cfg_default"
+            if args.action_noise_std is None
+            else f"{args.action_noise_std:.3f}"
+        ),
+        args.random_action_frac,
     )
 
     torch.manual_seed(args.seed)
@@ -605,6 +663,10 @@ def main(argv: list[str] | None = None) -> int:
                 cfg.collect,
                 max_episode_len=max_episode_len,
                 z_obs_dtype=z_obs_dtype,
+                action_noise_std=args.action_noise_std,
+                random_action_frac=args.random_action_frac,
+                random_action_low=args.random_action_low,
+                random_action_high=args.random_action_high,
             )
         except Exception:
             log.exception("episode %d failed; skipping", ep + 1)
