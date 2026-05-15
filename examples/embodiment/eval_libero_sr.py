@@ -172,6 +172,76 @@ def _make_env(cfg_env, max_episode_len: int, seed: int):
 # --------------------------------------------------------------------------- #
 # σ-QRT actor reload (optional)
 # --------------------------------------------------------------------------- #
+_CKPT_ARCH_FIELDS = (
+    # Critic / IQL value head — sized differently per capacity sweep, so
+    # eval-time yaml will mismatch when ckpt was trained with a non-default
+    # capacity. These four are the load-bearing ones for shape mismatch.
+    "critic_hidden",
+    "critic_layers",
+    "v_hidden",
+    "v_layers",
+    # Actor / encoder / decoder arch — override too so future sweeps that vary
+    # these fields don't silently fail to load.
+    "actor_hidden",
+    "actor_layers",
+    "encoder_layers",
+    "encoder_heads",
+    "encoder_ffn",
+    "decoder_layers",
+    "decoder_heads",
+    "decoder_ffn",
+    "decoder_max_len",
+    "token_dim",
+)
+
+
+def _override_cfg_model_from_ckpt(cfg, ckpt_path: str) -> None:
+    """Overwrite ``cfg.model.*`` arch fields with values from the ckpt's saved cfg.
+
+    Capacity-sweep ckpts (e.g. g2_v2_critic_capacity) train with
+    critic_hidden=512/1024/2048 but eval-time yaml carries the 256 default.
+    Constructing the worker with mismatched dims and then ``load_state_dict``
+    raises a shape error. We peek at ``payload["cfg"]["model"]`` (a plain dict,
+    saved alongside the state dicts in run_qrt_offline.py) and override the
+    runtime ``cfg.model`` BEFORE the worker is built. Defensive: if the ckpt
+    has no saved cfg (older runs), we keep the yaml values unchanged.
+    """
+    try:
+        payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except Exception as e:  # pragma: no cover — IO/format issues
+        log.warning("could not peek ckpt cfg from %s: %s — keeping yaml", ckpt_path, e)
+        return
+    saved_cfg = payload.get("cfg") if isinstance(payload, dict) else None
+    if not isinstance(saved_cfg, dict):
+        log.info("ckpt %s has no saved cfg → keeping yaml model arch", ckpt_path)
+        return
+    saved_model = saved_cfg.get("model")
+    if not isinstance(saved_model, dict):
+        log.info("ckpt %s saved cfg has no 'model' dict → keeping yaml", ckpt_path)
+        return
+    overridden = {}
+    for k in _CKPT_ARCH_FIELDS:
+        if k not in saved_model:
+            continue
+        v_new = saved_model[k]
+        v_old = (
+            cfg.model.get(k)
+            if hasattr(cfg.model, "get")
+            else getattr(cfg.model, k, None)
+        )
+        if v_old != v_new:
+            cfg.model[k] = v_new
+            overridden[k] = (v_old, v_new)
+    if overridden:
+        log.info(
+            "ckpt cfg → overriding %d model arch field(s): %s",
+            len(overridden),
+            ", ".join(f"{k}: {old}→{new}" for k, (old, new) in overridden.items()),
+        )
+    else:
+        log.info("ckpt cfg → model arch matches yaml, no override needed")
+
+
 def _maybe_load_worker(cfg, ckpt_path: str | None, device: str):
     """Return a populated worker (encoder + actor) or None for B0."""
     if not ckpt_path:
@@ -179,6 +249,10 @@ def _maybe_load_worker(cfg, ckpt_path: str | None, device: str):
     from rlinf.workers.actor.fsdp_qrt_offline_policy_worker import (
         QRTOfflinePolicyWorker,
     )
+
+    # Align runtime cfg.model arch with the ckpt's saved cfg so the worker is
+    # constructed with the matching critic/v_net dims. See helper docstring.
+    _override_cfg_model_from_ckpt(cfg, ckpt_path)
 
     worker = QRTOfflinePolicyWorker(cfg, device=device)
     worker.setup()
